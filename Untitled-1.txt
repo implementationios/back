@@ -1,0 +1,7 @@
+-- database: c:\Users\leona\Desktop\Telemetry\backend\mydatabase
+
+-- Presione el botón ▷ en la esquina superior derecha de la ventana para ejecutar todo el archivo.
+
+SELECT * FROM telemetria_mergedtelemetricott
+WHERE dataDate BETWEEN DATE('now', '-7 days') AND DATE('now')
+ORDER BY `timeDate` ASC;
