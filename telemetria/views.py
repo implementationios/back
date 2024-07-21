@@ -1,6 +1,8 @@
 # Importa las bibliotecas y módulos necesarios
 from collections import defaultdict
 
+from django.views import View  
+
 from django.views.decorators.csrf import csrf_exempt  # Desactiva la protección CSRF
 from django.views.decorators.http import require_POST  # Requiere que la solicitud sea de tipo POST
 
@@ -8,6 +10,7 @@ from django.utils.decorators import method_decorator
 from django.utils import timezone
 
 from django.db import IntegrityError
+from django.db import transaction, DatabaseError
 
 from django.db.models import Q
 from django.db.models import Sum
@@ -26,122 +29,359 @@ from rest_framework.exceptions import ValidationError
 
 from datetime import datetime, timedelta
 
+from functools import wraps
+
 import json
 import gzip
+import logging
+import time
+import orjson
+import hashlib
+import requests
 
 from .models import Telemetria, MergedTelemetricOTT, MergedTelemetricDVB, MergedTelemetricStopCatchup, MergedTelemetricEndCatchup, MergedTelemetricStopVOD, MergedTelemetricEndVOD  # Importa los modelos necesarios
 from .serializer import TelemetriaSerializer, MergedTelemetricOTTSerializer, MergedTelemetricDVBSerializer, MergedTelemetricCatchupSerializer, MergedTelemetricVODSerializer # Importa los serializadores necesarios
 
-# Decora la vista para deshabilitar la protección CSRF y permitir solicitudes POST sin autenticación
-@csrf_exempt
-@require_POST
-def DataTelemetria(request):
-    try:
-        # Descomprimir los datos Gzip
-        compressed_data = request.body
-        decompressed_data = gzip.decompress(compressed_data).decode('utf-8')
+logger = logging.getLogger(__name__)
 
-        # Parsear los datos descomprimidos del cuerpo de la solicitud como JSON
-        data_batch = json.loads(decompressed_data)
+# Clase para manejar la comunicación con el sistema CV
+class CVClient:
+    def __init__(self, base_url="https://cv10.panaccess.com", mode="json", jsonp_timeout=5000):
+        self.base_url = base_url
+        self.mode = mode
+        self.jsonp_timeout = jsonp_timeout
+        self.session_id = None
 
-        # Lista para almacenar respuestas individuales para cada registro en el lote
-        responses = []
-        telemetria_instances = []
+    # Función para generar un hash MD5 del password
+    def md5_hash(self, password):
+        salt = "_panaccess"
+        hashed_password = hashlib.md5((password + salt).encode()).hexdigest()
+        return hashed_password
 
-        # Crear instancias de Telemetria
-        for data in data_batch:
-            existing_record = Telemetria.objects.filter(recordId=data.get('recordId')).first()
-            if existing_record:
-                return JsonResponse({'status': 'success', 'message': 'Duplicate record'})
-            else:
-                telemetria_instances.append(Telemetria(
-                    actionId=data.get('actionId'),
-                    actionKey=data.get('actionKey'),
-                    anonymized=data.get('anonymized'),
-                    dataDuration=data.get('dataDuration'),
-                    dataId=data.get('dataId'),
-                    dataName=data.get('dataName'),
-                    dataNetId=data.get('dataNetId'),
-                    dataPrice=data.get('dataPrice'),
-                    dataSeviceId=data.get('dataSeviceId'),
-                    dataTsId=data.get('dataTsId'),
-                    date=data.get('date'),
-                    deviceId=data.get('deviceId'),
-                    ip=data.get('ip'),
-                    ipId=data.get('ipId'),
-                    manual=data.get('manual'),
-                    profileId=data.get('profileId'),
-                    reaonId=data.get('reaonId'),
-                    reasonKey=data.get('reasonKey'),
-                    recordId=data.get('recordId'),
-                    smartcardId=data.get('smartcardId'),
-                    subscriberCode=data.get('subscriberCode'),
-                    timestamp=data.get('timestamp'),
-                    dataDate=data.get('dataDate'),
-                    timeDate=data.get('timeDate'),
-                    whoisCountry=data.get('whoisCountry'),
-                    whoisIsp=data.get('whoisIsp')
-                ))
+    # Función para serializar los parámetros en una cadena de consulta
+    def serialize(self, obj):
+        return "&".join(f"{k}={v}" for k, v in obj.items())
 
-        # Guardar instancias de Telemetria en la base de datos
-        Telemetria.objects.bulk_create(telemetria_instances)
-
-        # Crear respuestas exitosas
-        responses.extend([{'status': 'success'} for _ in telemetria_instances])
+    # Función genérica para realizar llamadas a funciones del sistema CV
+    def call(self, func_name, parameters):
+        url = f"{self.base_url}?f={func_name}&requestMode=function"
         
-        # Devolver las respuestas para cada registro en el lote
-        return JsonResponse(responses, safe=False)
-    except Exception as e:
-        # En caso de error, devuelve una respuesta de error con un mensaje
-        return JsonResponse({'status': 'error', 'message': str(e)})
+        # Añadir el sessionId a los parámetros si no es una llamada de login
+        if self.session_id is not None and func_name != 'login':
+            parameters['sessionId'] = self.session_id
+        
+        param_string = self.serialize(parameters)
+        
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        
+        response = requests.post(url, data=param_string, headers=headers)
+        
+        # Manejo de la respuesta de la API
+        if response.status_code == 200:
+            try:
+                result = response.json()
+            except ValueError:
+                result = {
+                    "success": False,
+                    "errorCode": "json_parse_error",
+                    "errorMessage": "Failed to parse JSON response"
+                }
+            return result
+        else:
+            return {
+                "success": False,
+                "errorCode": "unknown_error",
+                "errorMessage": f"({response.status_code}) An unknown error occurred!"
+            }
 
-## funcion para poder almacenar los registros en la base de datos
-class MergeData(APIView):
+    # Función para realizar el login en el sistema CV
+    def login(self, api_token, username, password):
+        password_hash = self.md5_hash(password)
+        
+        result = self.call(
+            "login", 
+            {
+                "username": username,
+                "password": password_hash,
+                "apiToken": api_token
+            }
+        )
+        
+        # Manejo de la respuesta del login
+        if result.get("success"):
+            session_id = result.get("answer")
+            if session_id:
+                self.session_id = session_id
+                return True, None
+            else:
+                return False, "Username or password wrong"
+        else:
+            return False, result.get("errorMessage")
+
+    # Función para obtener la lista de registros de telemetría con paginación
+    def get_list_of_telemetry_records(self, offset, limit):
+        return self.call(
+            "getListOfTelemetryRecords",
+            {
+                "sessionId": self.session_id,
+                "offset": offset,
+                "limit": limit,
+                "orderBy": "recordId",
+                "orderDir": "DESC"
+            }
+        )
+
+# Función para verificar si la base de datos está vacía
+def is_database_empty():
+    return not Telemetria.objects.exists()
+
+# Función para obtener la hora de un timestamp
+def get_time_date(timestamp):
+    data = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+    return data.hour
+
+# Función para obtener la fecha de un timestamp
+def get_data_date(timestamp):
+    data = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+    return data.date().isoformat()
+
+# Función para extraer detalles del timestamp y añadirlos a los registros
+def extract_timestamp_details(data):
+    for record in data:
+        try:
+            timestamp = record["timestamp"]
+            record["dataDate"] = get_data_date(timestamp)
+            record["timeDate"] = get_time_date(timestamp)
+        except (ValueError, KeyError) as e:
+            logger.error(f"Error processing timestamp for record {record}: {e}")
+            record["dataDate"] = None
+            record["timeDate"] = None
+    return data
+
+# Función para almacenar los datos de telemetría en la base de datos
+def store_telemetry_data(data_batch):
+    # Obtener los recordIds de los datos y verificar los existentes en la base de datos
+    record_ids = {item['recordId'] for item in data_batch if 'recordId' in item}
+    existing_record_ids = set(Telemetria.objects.filter(
+        recordId__in=record_ids
+    ).values_list('recordId', flat=True))
+
+    batch_size = 1000
+    total_processed = 0
+    total_invalid = 0
+    with transaction.atomic():
+        telemetry_objects = []
+        for item in data_batch:
+            if item.get('recordId') not in existing_record_ids:
+                serializer = TelemetriaSerializer(data=item)
+                if serializer.is_valid():
+                    telemetry_object = Telemetria(**serializer.validated_data)
+                    telemetry_objects.append(telemetry_object)
+                    total_processed += 1
+                else:
+                    logger.warning(f"Invalid data: {serializer.errors}")
+                    total_invalid += 1
+
+            # Almacenar en la base de datos en lotes
+            if len(telemetry_objects) >= batch_size:
+                Telemetria.objects.bulk_create(telemetry_objects, ignore_conflicts=True)
+                logger.info(f"Inserted batch of {len(telemetry_objects)} objects")
+                telemetry_objects = []
+
+        # Almacenar cualquier dato restante en la base de datos
+        if telemetry_objects:
+            Telemetria.objects.bulk_create(telemetry_objects, ignore_conflicts=True)
+            logger.info(f"Inserted final batch of {len(telemetry_objects)} objects")
+
+    logger.info(f"Total processed: {total_processed}, Total invalid: {total_invalid}")
+
+# Función para obtener todos los datos de telemetría con paginación
+def fetch_all_data(client, limit):
+    currentPage = 0
+    allTelemetryData = []
+
+    while True:
+        result = client.get_list_of_telemetry_records(currentPage, limit)
+        if not result.get("success"):
+            raise Exception(f"Error al obtener datos: {result.get('errorMessage')}")
+        
+        data = result.get("answer", {}).get("telemetryRecordEntries", [])
+        if not data:
+            break
+        
+        allTelemetryData.extend(data)
+        currentPage += limit
+
+    return allTelemetryData
+
+# Función para obtener datos de telemetría hasta un recordId específico
+def fetch_data_up_to(client, highestRecordId, limit):
+    currentPage = 0
+    allTelemetryData = []
+    foundRecord = False
+
+    while True:
+        result = client.get_list_of_telemetry_records(currentPage, limit)
+        if not result.get("success"):
+            raise Exception(f"Error al obtener datos: {result.get('errorMessage')}")
+        
+        data = result.get("answer", {}).get("telemetryRecordEntries", [])
+        if not data:
+            break
+        
+        for record in data:
+            if record["recordId"] == highestRecordId:
+                foundRecord = True
+                break
+            allTelemetryData.append(record)
+        
+        if foundRecord:
+            break
+        
+        currentPage += limit
+
+    return allTelemetryData
+
+@method_decorator(csrf_exempt, name='dispatch')
+class TestFetchAndStoreTelemetry(View):
     def post(self, request, *args, **kwargs):
         try:
-            # Obtener los datos comprimidos del cuerpo de la solicitud
-            compressed_data = request.body
+            # Credenciales proporcionadas para la prueba
+            username = "yab_analitics"
+            password = "Analizar321!"
+            cv_token = "AhmLeBqnOJzPZzkeuXKa"
+            limit = 1000
+
+            # Inicializar el cliente CV y realizar el login
+            client = CVClient()
+            success, error_message = client.login(cv_token, username, password)
             
-            # Descomprimir los datos y decodificarlos como UTF-8
-            decompressed_data = gzip.decompress(compressed_data).decode('utf-8')
+            if not success:
+                return JsonResponse({"error": error_message}, status=400)
             
-            # Convertir los datos descomprimidos en un objeto Python
-            data_batch = json.loads(decompressed_data)
-            
-            # Iterar sobre cada conjunto de datos fusionados
-            for merged in data_batch:
-                # Obtener el 'recordId' del conjunto de datos actual
-                record_id = merged.get('recordId')
-                
-                # Verificar si ya existe un objeto con el mismo 'recordId'
-                if record_id:
-                    if Telemetria.objects.filter(recordId=record_id).exists():
-                        # Devolver un error si ya existe un objeto con el mismo 'recordId'
-                        return Response({"error": f"Registro con recordId '{record_id}' ya existe en la base de datos."}, status=status.HTTP_409_CONFLICT)
-                    else:
-                        # Crear un nuevo objeto Telemetria con los datos fusionados
-                        Telemetria.objects.create(**merged)
-            
-            # Devolver un mensaje de éxito si se procesaron todos los datos correctamente
-            return Response({"message": "Data processed successfully."}, status=status.HTTP_200_OK)
+            # Verificar si la base de datos está vacía
+            if is_database_empty():
+                data = fetch_all_data(client, limit)
+                message = "Fetched all data"
+            else:
+                highest_record = Telemetria.objects.order_by('-recordId').first()
+                highestRecordId = highest_record.recordId if highest_record else None
+                data = fetch_data_up_to(client, highestRecordId, limit)
+                message = "Fetched data up to highest recordId"
+
+            # Procesar datos para agregar fecha y hora
+            processed_data = extract_timestamp_details(data)
+
+            # Almacenar los datos en la base de datos
+            store_telemetry_data(processed_data)
+
+            return JsonResponse({
+                "message": message,
+                "data": processed_data
+            })
         
-        # Manejar excepciones si hay errores al decodificar los datos JSON
-        except json.JSONDecodeError as e:
-            return Response({"error": "Invalid JSON format in request body."}, status=status.HTTP_400_BAD_REQUEST)
-        
-        # Manejar excepciones si falta una clave en los datos fusionados
-        except KeyError as e:
-            return Response({"error": f"Missing key in data: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
-        
-        # Manejar cualquier otra excepción no manejada
         except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+            return JsonResponse({"error": str(e)}, status=500)
+
+#--------------------------------------------------------------------------------#
+
+def timeit(func):
+    @wraps(func)
+    def timeit_wrapper(*args, **kwargs):
+        start_time = time.perf_counter()
+        result = func(*args, **kwargs)
+        end_time = time.perf_counter()
+        total_time = end_time - start_time
+        logger.info(f'{func.__name__} took {total_time:.4f} seconds')
+        return result
+    return timeit_wrapper
+
+class MergeData(APIView):
+    @timeit
+    def post(self, request, *args, **kwargs):
+        start_time = time.time()
+        try:
+            # Descompresión y decodificación de datos
+            decompress_start_time = time.time()
+            compressed_data = request.body
+            decompressed_data = gzip.decompress(compressed_data)
+            decompress_end_time = time.time()
+            logger.info(f"Decompression took {decompress_end_time - decompress_start_time:.4f} seconds")
+
+            # Conversión a objeto Python
+            json_load_start_time = time.time()
+            data_batch = orjson.loads(decompressed_data)
+            json_load_end_time = time.time()
+            logger.info(f"JSON load took {json_load_end_time - json_load_start_time:.4f} seconds")
+
+            # Obtención de recordIds existentes
+            record_ids_start_time = time.time()
+            record_ids = {item['recordId'] for item in data_batch if 'recordId' in item}
+            existing_record_ids = set(Telemetria.objects.filter(
+                recordId__in=record_ids
+            ).values_list('recordId', flat=True))
+            record_ids_end_time = time.time()
+            logger.info(f"Fetching existing recordIds took {record_ids_end_time - record_ids_start_time:.4f} seconds")
+
+            # Creación e inserción de objetos Telemetria
+            process_start_time = time.time()
+            batch_size = 1000
+            total_processed = 0
+            total_invalid = 0
+            with transaction.atomic():
+                telemetry_objects = []
+                for item in data_batch:
+                    if item.get('recordId') not in existing_record_ids:
+                        serializer = TelemetriaSerializer(data=item)
+                        if serializer.is_valid():
+                            # Crear el objeto Telemetria sin guardarlo en la base de datos
+                            telemetry_object = Telemetria(**serializer.validated_data)
+                            telemetry_objects.append(telemetry_object)
+                            total_processed += 1
+                        else:
+                            logger.warning(f"Invalid data: {serializer.errors}")
+                            total_invalid += 1
+                    
+                    if len(telemetry_objects) >= batch_size:
+                        Telemetria.objects.bulk_create(telemetry_objects, ignore_conflicts=True)
+                        logger.info(f"Inserted batch of {len(telemetry_objects)} objects")
+                        telemetry_objects = []
+
+                if telemetry_objects:
+                    Telemetria.objects.bulk_create(telemetry_objects, ignore_conflicts=True)
+                    logger.info(f"Inserted final batch of {len(telemetry_objects)} objects")
+
+            process_end_time = time.time()
+            logger.info(f"Processing and inserting data took {process_end_time - process_start_time:.4f} seconds")
+            logger.info(f"Total processed: {total_processed}, Total invalid: {total_invalid}")
+
+            end_time = time.time()
+            logger.info(f"Total processing time: {end_time - start_time:.4f} seconds")
+
+            return Response({
+                "message": "Data processed successfully.",
+                "total_processed": total_processed,
+                "total_invalid": total_invalid
+            }, status=status.HTTP_201_CREATED)
+
+        except orjson.JSONDecodeError as e:
+            logger.error(f"JSONDecodeError: {e}")
+            return Response({"error": "Invalid JSON format in request body."}, status=status.HTTP_400_BAD_REQUEST)
+        except KeyError as e:
+            logger.error(f"KeyError: {e}")
+            return Response({"error": f"Missing key in data: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-    
-    def get(self, request, *args, **kwargs):
+
+    def get(self,request, *args, **kwargs):
         try:
             data = Telemetria.objects.all()
             if not data.exists():
-                return Response(status=status.HTTP_202_ACCEPTED)
+                return Response(status=status.HTTP_204_NO_CONTENT)
             else:
                 maxrecord = data.order_by("-recordId").first().recordId
                 return Response({"recordId_max":maxrecord}, status=status.HTTP_200_OK)
@@ -164,22 +404,22 @@ class MergeData(APIView):
 class UpdateDataOTT(APIView):
     @staticmethod
     def data_ott():
-        # Obtener datos filtrados por actionId=7
-        telemetria_data_actionid7 = Telemetria.objects.filter(actionId=7).values()
+        # Obtener datos filtrados por actionId=7 y 8 en una sola consulta
+        telemetria_data = Telemetria.objects.filter(actionId__in=[7, 8]).values()
 
-        # Obtener datos filtrados por actionId=8
-        telemetria_data_actionid8 = Telemetria.objects.filter(actionId=8).values()
+        # Crear diccionario para almacenar datos con actionId=7 y dataId como clave
+        actionid7_dict = {item['dataId']: item for item in telemetria_data if item['actionId'] == 7 and item['dataId'] is not None}
 
-        # Fusionar los datos relacionados
+        # Lista para almacenar datos fusionados
         merged_data = []
-        for item8 in telemetria_data_actionid8:
-            # Buscar el elemento correspondiente en telemetria_data_actionid7 que coincida con dataId
-            matching_item7 = next((item7 for item7 in telemetria_data_actionid7 if item7['dataId'] == item8['dataId']), None)
-            if matching_item7:
-                # Agregar el nombre de los datos de telemetria_data_actionid7 al elemento de telemetria_data_actionid8
-                item8['dataName'] = matching_item7['dataName']
-            # Agregar el elemento fusionado a la lista merged_data
-            merged_data.append(item8)
+
+        # Fusionar datos de actionId=8 con datos de actionId=7 basándose en dataId
+        for item in telemetria_data:
+            if item['actionId'] == 8:
+                matching_item7 = actionid7_dict.get(item['dataId'])
+                if matching_item7:
+                    item['dataName'] = matching_item7['dataName']
+                merged_data.append(item)
 
         return merged_data
 
@@ -187,32 +427,34 @@ class UpdateDataOTT(APIView):
         try:
             # Obtener datos fusionados
             merged_data = self.data_ott()
+
             # Obtener el máximo valor de recordId en la tabla MergedTelemetricOTT
             id_maximo_registro = MergedTelemetricOTT.objects.aggregate(max_record=Max('recordId'))['max_record']
 
             # Manejar el caso en el que id_maximo_registro sea None
-            if id_maximo_registro is None:
-                id_maximo_registro = 0
+            id_maximo_registro = id_maximo_registro or 0
 
             # Filtrar los registros que tengan un recordId mayor que id_maximo_registro
-            registros_filtrados = [registro for registro in merged_data if registro['recordId'] > id_maximo_registro]
+            registros_filtrados = [registro for registro in merged_data if registro['recordId'] is not None and registro['recordId'] > id_maximo_registro]
 
             # Verificar si no hay registros filtrados
             if not registros_filtrados:
                 return Response({"message": "No hay nuevos registros para crear"}, status=status.HTTP_200_OK)
 
-            # Verificar si el máximo registro en la base de datos es igual al máximo entre los registros filtrados
-            if id_maximo_registro == max(registro['recordId'] for registro in registros_filtrados):
-                return Response({"message": "No hay nuevos registros para crear"}, status=status.HTTP_200_OK)
-
             # Verificar si la tabla MergedTelemetricOTT está vacía
             if not MergedTelemetricOTT.objects.exists():
                 # Crear objetos MergedTelemetricOTT utilizando bulk_create si la tabla está vacía
-                MergedTelemetricOTT.objects.bulk_create([MergedTelemetricOTT(**data) for data in merged_data])
+                MergedTelemetricOTT.objects.bulk_create(
+                    [MergedTelemetricOTT(**data) for data in merged_data],
+                    ignore_conflicts=True
+                )
                 return Response({"message": "Creación exitosa en base vacía"}, status=status.HTTP_200_OK)
             else:
                 # Crear objetos MergedTelemetricOTT utilizando bulk_create si la tabla no está vacía
-                MergedTelemetricOTT.objects.bulk_create([MergedTelemetricOTT(**data) for data in registros_filtrados])
+                MergedTelemetricOTT.objects.bulk_create(
+                    [MergedTelemetricOTT(**data) for data in registros_filtrados],
+                    ignore_conflicts=True
+                )
                 return Response({"message": "Creación exitosa en base llena"}, status=status.HTTP_200_OK)
 
         except IntegrityError:
@@ -236,23 +478,25 @@ class UpdateDataOTT(APIView):
 
 ## actualización de los datos de DVB
 class UpdateDataDVB(APIView):
-    def dataDVB(self):
-        # Obtener datos filtrados por actionId=5
-        telemetria_data_actionid5 = Telemetria.objects.filter(actionId=5).values()
+    @staticmethod
+    def dataDVB():
+        # Obtener datos filtrados por actionId=5 y 6 en una sola consulta
+        telemetria_data = Telemetria.objects.filter(actionId__in=[5, 6]).only('dataId', 'actionId', 'dataName').iterator()
 
-        # Obtener datos filtrados por actionId=6
-        telemetria_data_actionid6 = Telemetria.objects.filter(actionId=6).values()
+        # Crear diccionario para almacenar datos con actionId=5 y dataId como clave
+        actionid5_dict = {item.dataId: item.dataName for item in telemetria_data if item.actionId == 5 and item.dataId is not None}
 
-        # Fusionar los datos relacionados
+        # Lista para almacenar datos fusionados
         merged_data = []
-        for item6 in telemetria_data_actionid6:
-            # Buscar el elemento correspondiente en telemetria_data_actionid5 que coincida con dataId
-            matching_item5 = next((item5 for item5 in telemetria_data_actionid5 if item5['dataId'] == item6['dataId']), None)
-            if matching_item5:
-                # Agregar el nombre de los datos de telemetria_data_actionid5 al elemento de telemetria_data_actionid6
-                item6['dataName'] = matching_item5['dataName']
-            # Agregar el elemento fusionado a la lista merged_data
-            merged_data.append(item6)
+
+        # Reiniciar el iterador para recorrer nuevamente los datos
+        telemetria_data = Telemetria.objects.filter(actionId__in=[5, 6]).only('dataId', 'actionId').iterator()
+
+        # Fusionar datos de actionId=6 con datos de actionId=5 basándose en dataId
+        for item in telemetria_data:
+            if item.actionId == 6:
+                item.dataName = actionid5_dict.get(item.dataId)
+                merged_data.append(item)
 
         return merged_data
 
@@ -260,43 +504,40 @@ class UpdateDataDVB(APIView):
         try:
             # Obtener datos fusionados
             merged_data = self.dataDVB()
-            # Obtener el máximo valor de recordId en la tabla MergedTelemetricDVB
-            id_maximo_registro = MergedTelemetricDVB.objects.aggregate(max_record=Max('recordId'))['max_record']
 
-            # Manejar el caso en el que id_maximo_registro sea None
-            if id_maximo_registro is None:
-                id_maximo_registro = 0
+            # Obtener el máximo valor de recordId en la tabla MergedTelemetricDVB
+            id_maximo_registro = MergedTelemetricDVB.objects.aggregate(max_record=Max('recordId'))['max_record'] or 0
 
             # Filtrar los registros que tengan un recordId mayor que id_maximo_registro
-            registros_filtrados = [registro for registro in merged_data if registro['recordId'] > id_maximo_registro]
+            registros_filtrados = [registro for registro in merged_data if registro.recordId is not None and registro.recordId > id_maximo_registro]
 
             # Verificar si no hay registros filtrados
             if not registros_filtrados:
                 return Response({"message": "No hay nuevos registros para crear"}, status=status.HTTP_200_OK)
 
-            # Verificar si el máximo registro en la base de datos es igual al máximo entre los registros filtrados
-            if id_maximo_registro == max(registro['recordId'] for registro in registros_filtrados):
-                return Response({"message": "No hay nuevos registros para crear"}, status=status.HTTP_200_OK)
-
-            # Verificar si la tabla MergedTelemetricDVB está vacía
-            if not MergedTelemetricDVB.objects.exists():
-                # Crear objetos MergedTelemetricDVB utilizando bulk_create si la tabla está vacía
-                MergedTelemetricDVB.objects.bulk_create([MergedTelemetricDVB(**data) for data in merged_data])
-                return Response({"message": "Creación exitosa en base vacía"}, status=status.HTTP_200_OK)
-            else:
-                # Crear objetos MergedTelemetricDVB utilizando bulk_create si la tabla no está vacía
-                MergedTelemetricDVB.objects.bulk_create([MergedTelemetricDVB(**data) for data in registros_filtrados])
-                return Response({"message": "Creación exitosa en base llena"}, status=status.HTTP_200_OK)
+            with transaction.atomic():
+                # Verificar si la tabla MergedTelemetricDVB está vacía
+                if not MergedTelemetricDVB.objects.exists():
+                    # Crear objetos MergedTelemetricDVB utilizando bulk_create si la tabla está vacía
+                    MergedTelemetricDVB.objects.bulk_create(
+                        [MergedTelemetricDVB(**data.__dict__) for data in merged_data],
+                        ignore_conflicts=True
+                    )
+                    return Response({"message": "Creación exitosa en base vacía"}, status=status.HTTP_200_OK)
+                else:
+                    # Crear objetos MergedTelemetricDVB utilizando bulk_create si la tabla no está vacía
+                    MergedTelemetricDVB.objects.bulk_create(
+                        [MergedTelemetricDVB(**data.__dict__) for data in registros_filtrados],
+                        ignore_conflicts=True
+                    )
+                    return Response({"message": "Creación exitosa en base llena"}, status=status.HTTP_200_OK)
 
         except IntegrityError:
             return Response({"error": "Error de integridad al guardar datos"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
         except ValidationError as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
-
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
 
     def get(self, request, *args, **kwargs):
         # Obtiene todos los objetos de la tabla MergedTelemetricDVB en la base de datos
@@ -307,7 +548,6 @@ class UpdateDataDVB(APIView):
         
         # Devuelve una respuesta con los datos serializados
         return Response(serializer.data, status=status.HTTP_200_OK)
-
 ## actualización de los datos de catchup pausado
 class UpdateDataStopCatchup(APIView):
     def dataStop(self):
@@ -379,63 +619,66 @@ class UpdateDataStopCatchup(APIView):
 
 ## actualización de los datos de catchup terminado
 class UpdateDataEndCatchup(APIView):
-    def dataEnd(self):
-        # Obtener datos filtrados por actionId=17
-        telemetria_data_actionid16 = Telemetria.objects.filter(actionId=16).values()
-        
-        # Obtener datos filtrados por actionId=6
-        telemetria_data_actionid18 = Telemetria.objects.filter(actionId=18).values()
+    @staticmethod
+    def dataEnd():
+        # Obtener datos filtrados por actionId=16 y 18 en una sola consulta
+        telemetria_data = Telemetria.objects.filter(actionId__in=[16, 18]).only('dataId', 'actionId', 'dataName').iterator()
 
-        # Fusionar los datos relacionados
+        # Crear diccionario para almacenar datos con actionId=16 y dataId como clave
+        actionid16_dict = {item.dataId: item.dataName for item in telemetria_data if item.actionId == 16 and item.dataId is not None}
+
+        # Lista para almacenar datos fusionados
         merged_data = []
-        for item18 in telemetria_data_actionid18:
-            matching_item16 = next((item16 for item16 in telemetria_data_actionid16 if item16['dataId'] == item18['dataId']), None)
-            if matching_item16:
-                item18['dataName'] = matching_item16['dataName']
-            merged_data.append(item18)
+
+        # Reiniciar el iterador para recorrer nuevamente los datos
+        telemetria_data = Telemetria.objects.filter(actionId__in=[16, 18]).only('dataId', 'actionId').iterator()
+
+        # Fusionar datos de actionId=18 con datos de actionId=16 basándose en dataId
+        for item in telemetria_data:
+            if item.actionId == 18:
+                item.dataName = actionid16_dict.get(item.dataId)
+                merged_data.append(item)
 
         return merged_data
+
     def post(self, request):
         try:
             # Obtener datos fusionados
             merged_data = self.dataEnd()
-            # Obtener el máximo valor de recordId en la tabla MergedTelemetricEndCatchup
-            id_maximo_registro = MergedTelemetricEndCatchup.objects.aggregate(max_record=Max('recordId'))['max_record']
 
-            # Manejar el caso en el que id_maximo_registro sea None
-            if id_maximo_registro is None:
-                id_maximo_registro = 0
+            # Obtener el máximo valor de recordId en la tabla MergedTelemetricEndCatchup
+            id_maximo_registro = MergedTelemetricEndCatchup.objects.aggregate(max_record=Max('recordId'))['max_record'] or 0
 
             # Filtrar los registros que tengan un recordId mayor que id_maximo_registro
-            registros_filtrados = [registro for registro in merged_data if registro['recordId'] > id_maximo_registro]
+            registros_filtrados = [registro for registro in merged_data if registro.recordId is not None and registro.recordId > id_maximo_registro]
 
             # Verificar si no hay registros filtrados
             if not registros_filtrados:
                 return Response({"message": "No hay nuevos registros para crear"}, status=status.HTTP_200_OK)
 
-            # Verificar si el máximo registro en la base de datos es igual al máximo entre los registros filtrados
-            if id_maximo_registro == max(registro['recordId'] for registro in registros_filtrados):
-                return Response({"message": "No hay nuevos registros para crear"}, status=status.HTTP_200_OK)
-
-            # Verificar si la tabla MergedTelemetricEndCatchup está vacía
-            if not MergedTelemetricEndCatchup.objects.exists():
-                # Crear objetos MergedTelemetricEndCatchup utilizando bulk_create si la tabla está vacía
-                MergedTelemetricEndCatchup.objects.bulk_create([MergedTelemetricEndCatchup(**data) for data in merged_data])
-                return Response({"message": "Creación exitosa en base vacía"}, status=status.HTTP_200_OK)
-            else:
-                # Crear objetos MergedTelemetricEndCatchup utilizando bulk_create si la tabla no está vacía
-                MergedTelemetricEndCatchup.objects.bulk_create([MergedTelemetricEndCatchup(**data) for data in registros_filtrados])
-                return Response({"message": "Creación exitosa en base llena"}, status=status.HTTP_200_OK)
+            with transaction.atomic():
+                # Verificar si la tabla MergedTelemetricEndCatchup está vacía
+                if not MergedTelemetricEndCatchup.objects.exists():
+                    # Crear objetos MergedTelemetricEndCatchup utilizando bulk_create si la tabla está vacía
+                    MergedTelemetricEndCatchup.objects.bulk_create(
+                        [MergedTelemetricEndCatchup(**data.__dict__) for data in merged_data],
+                        ignore_conflicts=True
+                    )
+                    return Response({"message": "Creación exitosa en base vacía"}, status=status.HTTP_200_OK)
+                else:
+                    # Crear objetos MergedTelemetricEndCatchup utilizando bulk_create si la tabla no está vacía
+                    MergedTelemetricEndCatchup.objects.bulk_create(
+                        [MergedTelemetricEndCatchup(**data.__dict__) for data in registros_filtrados],
+                        ignore_conflicts=True
+                    )
+                    return Response({"message": "Creación exitosa en base llena"}, status=status.HTTP_200_OK)
 
         except IntegrityError:
             return Response({"error": "Error de integridad al guardar datos"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
         except ValidationError as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
-
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
 
     def get(self, request, *args, **kwargs):
         # Obtiene todos los objetos de la tabla MergedTelemetricEndCatchup en la base de datos
@@ -449,60 +692,64 @@ class UpdateDataEndCatchup(APIView):
 
 ## actualización de los datos de VOD pausados
 class UpdateDataStopVOD(APIView):
-    def dataStop(self):
-        # Obtener datos filtrados por actionId=17
-        telemetria_data_actionid13 = Telemetria.objects.filter(actionId=13).values()
-        
-        # Obtener datos filtrados por actionId=6
-        telemetria_data_actionid14 = Telemetria.objects.filter(actionId=14).values()
+    @staticmethod
+    def dataStop():
+        # Obtener datos filtrados por actionId=13 y 14 en una sola consulta
+        telemetria_data = Telemetria.objects.filter(actionId__in=[13, 14]).only('dataId', 'actionId', 'dataName').iterator()
 
-        # Fusionar los datos relacionados
+        # Crear diccionario para almacenar datos con actionId=13 y dataId como clave
+        actionid13_dict = {item.dataId: item.dataName for item in telemetria_data if item.actionId == 13 and item.dataId is not None}
+
+        # Lista para almacenar datos fusionados
         merged_data = []
-        for item14 in telemetria_data_actionid14:
-            matching_item13 = next((item13 for item13 in telemetria_data_actionid13 if item13['dataId'] == item14['dataId']), None)
-            if matching_item13:
-                item14['dataName'] = matching_item13['dataName']
-            merged_data.append(item14)
+
+        # Reiniciar el iterador para recorrer nuevamente los datos
+        telemetria_data = Telemetria.objects.filter(actionId__in=[13, 14]).only('dataId', 'actionId').iterator()
+
+        # Fusionar datos de actionId=14 con datos de actionId=13 basándose en dataId
+        for item in telemetria_data:
+            if item.actionId == 14:
+                item.dataName = actionid13_dict.get(item.dataId)
+                merged_data.append(item)
 
         return merged_data
+
     def post(self, request):
         try:
             # Obtener datos fusionados
             merged_data = self.dataStop()
-            # Obtener el máximo valor de recordId en la tabla MergedTelemetricStopVOD
-            id_maximo_registro = MergedTelemetricStopVOD.objects.aggregate(max_record=Max('recordId'))['max_record']
 
-            # Manejar el caso en el que id_maximo_registro sea None
-            if id_maximo_registro is None:
-                id_maximo_registro = 0
+            # Obtener el máximo valor de recordId en la tabla MergedTelemetricStopVOD
+            id_maximo_registro = MergedTelemetricStopVOD.objects.aggregate(max_record=Max('recordId'))['max_record'] or 0
 
             # Filtrar los registros que tengan un recordId mayor que id_maximo_registro
-            registros_filtrados = [registro for registro in merged_data if registro['recordId'] > id_maximo_registro]
+            registros_filtrados = [registro for registro in merged_data if registro.recordId is not None and registro.recordId > id_maximo_registro]
 
             # Verificar si no hay registros filtrados
             if not registros_filtrados:
                 return Response({"message": "No hay nuevos registros para crear"}, status=status.HTTP_200_OK)
 
-            # Verificar si el máximo registro en la base de datos es igual al máximo entre los registros filtrados
-            if id_maximo_registro == max(registro['recordId'] for registro in registros_filtrados):
-                return Response({"message": "No hay nuevos registros para crear"}, status=status.HTTP_200_OK)
-
-            # Verificar si la tabla MergedTelemetricStopVOD está vacía
-            if not MergedTelemetricStopVOD.objects.exists():
-                # Crear objetos MergedTelemetricStopVOD utilizando bulk_create si la tabla está vacía
-                MergedTelemetricStopVOD.objects.bulk_create([MergedTelemetricStopVOD(**data) for data in merged_data])
-                return Response({"message": "Creación exitosa en base vacía"}, status=status.HTTP_200_OK)
-            else:
-                # Crear objetos MergedTelemetricStopVOD utilizando bulk_create si la tabla no está vacía
-                MergedTelemetricStopVOD.objects.bulk_create([MergedTelemetricStopVOD(**data) for data in registros_filtrados])
-                return Response({"message": "Creación exitosa en base llena"}, status=status.HTTP_200_OK)
+            with transaction.atomic():
+                # Verificar si la tabla MergedTelemetricStopVOD está vacía
+                if not MergedTelemetricStopVOD.objects.exists():
+                    # Crear objetos MergedTelemetricStopVOD utilizando bulk_create si la tabla está vacía
+                    MergedTelemetricStopVOD.objects.bulk_create(
+                        [MergedTelemetricStopVOD(**data.__dict__) for data in merged_data],
+                        ignore_conflicts=True
+                    )
+                    return Response({"message": "Creación exitosa en base vacía"}, status=status.HTTP_200_OK)
+                else:
+                    # Crear objetos MergedTelemetricStopVOD utilizando bulk_create si la tabla no está vacía
+                    MergedTelemetricStopVOD.objects.bulk_create(
+                        [MergedTelemetricStopVOD(**data.__dict__) for data in registros_filtrados],
+                        ignore_conflicts=True
+                    )
+                    return Response({"message": "Creación exitosa en base llena"}, status=status.HTTP_200_OK)
 
         except IntegrityError:
             return Response({"error": "Error de integridad al guardar datos"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
         except ValidationError as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
-
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -518,60 +765,64 @@ class UpdateDataStopVOD(APIView):
 
 # ## actualización de los datos de VOD terminado
 class UpdateDataEndVOD(APIView):
-    def dataEnd(self):
-        # Obtener datos filtrados por actionId=17
-        telemetria_data_actionid16 = Telemetria.objects.filter(actionId=16).values()
-        
-        # Obtener datos filtrados por actionId=6
-        telemetria_data_actionid18 = Telemetria.objects.filter(actionId=18).values()
+    @staticmethod
+    def dataEnd():
+        # Obtener datos filtrados por actionId=16 y 18 en una sola consulta
+        telemetria_data = Telemetria.objects.filter(actionId__in=[16, 18]).only('dataId', 'actionId', 'dataName').iterator()
 
-        # Fusionar los datos relacionados
+        # Crear diccionario para almacenar datos con actionId=16 y dataId como clave
+        actionid16_dict = {item.dataId: item.dataName for item in telemetria_data if item.actionId == 16 and item.dataId is not None}
+
+        # Lista para almacenar datos fusionados
         merged_data = []
-        for item18 in telemetria_data_actionid18:
-            matching_item16 = next((item16 for item16 in telemetria_data_actionid16 if item16['dataId'] == item18['dataId']), None)
-            if matching_item16:
-                item18['dataName'] = matching_item16['dataName']
-            merged_data.append(item18)
+
+        # Reiniciar el iterador para recorrer nuevamente los datos
+        telemetria_data = Telemetria.objects.filter(actionId__in=[16, 18]).only('dataId', 'actionId').iterator()
+
+        # Fusionar datos de actionId=18 con datos de actionId=16 basándose en dataId
+        for item in telemetria_data:
+            if item.actionId == 18:
+                item.dataName = actionid16_dict.get(item.dataId)
+                merged_data.append(item)
 
         return merged_data
+
     def post(self, request):
         try:
             # Obtener datos fusionados
             merged_data = self.dataEnd()
-            # Obtener el máximo valor de recordId en la tabla MergedTelemetricEndVOD
-            id_maximo_registro = MergedTelemetricEndVOD.objects.aggregate(max_record=Max('recordId'))['max_record']
 
-            # Manejar el caso en el que id_maximo_registro sea None
-            if id_maximo_registro is None:
-                id_maximo_registro = 0
+            # Obtener el máximo valor de recordId en la tabla MergedTelemetricEndVOD
+            id_maximo_registro = MergedTelemetricEndVOD.objects.aggregate(max_record=Max('recordId'))['max_record'] or 0
 
             # Filtrar los registros que tengan un recordId mayor que id_maximo_registro
-            registros_filtrados = [registro for registro in merged_data if registro['recordId'] > id_maximo_registro]
+            registros_filtrados = [registro for registro in merged_data if registro.recordId is not None and registro.recordId > id_maximo_registro]
 
             # Verificar si no hay registros filtrados
             if not registros_filtrados:
                 return Response({"message": "No hay nuevos registros para crear"}, status=status.HTTP_200_OK)
 
-            # Verificar si el máximo registro en la base de datos es igual al máximo entre los registros filtrados
-            if id_maximo_registro == max(registro['recordId'] for registro in registros_filtrados):
-                return Response({"message": "No hay nuevos registros para crear"}, status=status.HTTP_200_OK)
-
-            # Verificar si la tabla MergedTelemetricEndVOD está vacía
-            if not MergedTelemetricEndVOD.objects.exists():
-                # Crear objetos MergedTelemetricEndVOD utilizando bulk_create si la tabla está vacía
-                MergedTelemetricEndVOD.objects.bulk_create([MergedTelemetricEndVOD(**data) for data in merged_data])
-                return Response({"message": "Creación exitosa en base vacía"}, status=status.HTTP_200_OK)
-            else:
-                # Crear objetos MergedTelemetricEndVOD utilizando bulk_create si la tabla no está vacía
-                MergedTelemetricEndVOD.objects.bulk_create([MergedTelemetricEndVOD(**data) for data in registros_filtrados])
-                return Response({"message": "Creación exitosa en base llena"}, status=status.HTTP_200_OK)
+            with transaction.atomic():
+                # Verificar si la tabla MergedTelemetricEndVOD está vacía
+                if not MergedTelemetricEndVOD.objects.exists():
+                    # Crear objetos MergedTelemetricEndVOD utilizando bulk_create si la tabla está vacía
+                    MergedTelemetricEndVOD.objects.bulk_create(
+                        [MergedTelemetricEndVOD(**data.__dict__) for data in merged_data],
+                        ignore_conflicts=True
+                    )
+                    return Response({"message": "Creación exitosa en base vacía"}, status=status.HTTP_200_OK)
+                else:
+                    # Crear objetos MergedTelemetricEndVOD utilizando bulk_create si la tabla no está vacía
+                    MergedTelemetricEndVOD.objects.bulk_create(
+                        [MergedTelemetricEndVOD(**data.__dict__) for data in registros_filtrados],
+                        ignore_conflicts=True
+                    )
+                    return Response({"message": "Creación exitosa en base llena"}, status=status.HTTP_200_OK)
 
         except IntegrityError:
             return Response({"error": "Error de integridad al guardar datos"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
         except ValidationError as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
-
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -667,6 +918,24 @@ class TelemetriaHome(APIView):
         except Exception as e:
             print(f"Ocurrió un error durante la consulta a la base de datos: {e}")
             return None
+    
+    def listCountEventOTT(self, days):
+        try:
+            if days > 0:
+                today = datetime.now().date()
+                start_date = today - timedelta(days=days)
+                dataOTT = MergedTelemetricOTT.objects.filter(dataDate__range=[start_date, today])
+            else:
+                dataOTT = MergedTelemetricOTT.objects.all()
+            
+            ott = {}
+            for item in dataOTT:
+                event = item.dataName
+                ott[event] = ott.get(event, 0) + 1
+            return ott
+        
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
     def franjaHorarioEventOTT(self, days):
         try:
@@ -818,6 +1087,25 @@ class TelemetriaHome(APIView):
             print(f"Ocurrió un error durante la consulta a la base de datos: {e}")
             return None
 
+
+    def listCountEventDVB(self, days):
+        try:
+            if days > 0:
+                today = datetime.now().date()
+                start_date = today - timedelta(days=days)
+                dataOTT = MergedTelemetricDVB.objects.filter(dataDate__range=[start_date, today])
+            else:
+                dataOTT = MergedTelemetricDVB.objects.all()
+            
+            ott = {}
+            for item in dataOTT:
+                event = item.dataName
+                ott[event] = ott.get(event, 0) + 1
+            return ott
+        
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
     def countVOD(self, days):
         try:
             if days > 0:
@@ -899,10 +1187,12 @@ class TelemetriaHome(APIView):
             franjaHorarioOOT = self.franjaHorarioOTT(days)
             ottEvents = self.listEventOTT(days)
             franjahorariaEventsOTT = self.franjaHorarioEventOTT(days)
+            listCountEventOTT = self.listCountEventOTT(days)
             durationDVB = self.dataRangeDVB(days)
             franjaHorariaDVB = self.franjaHorarioDVB(days)
             franjahorariaEventsDVB = self.franjaHorarioEventDVB(days)
             dvbEvents = self.listEventDVB(days)
+            listCountEventDVB = self.listCountEventDVB(days)
             vodCount = self.countVOD(days)
             vodEvents = self.listEventVOD(days)
             catchupCount = self.countCatchup(days)
@@ -913,10 +1203,12 @@ class TelemetriaHome(APIView):
                     "franjahorariaott": franjaHorarioOOT,
                     "listOTT": ottEvents,
                     "franjahorariaeventott":franjahorariaEventsOTT,
+                    "listCountEventOTT":listCountEventOTT,
                     "totaldurationdvb": durationDVB,
                     "franjahorariadvb": franjaHorariaDVB,
-                    "listDVB": dvbEvents,
                     "franjahorariaeventodvb":franjahorariaEventsDVB,
+                    "listDVB": dvbEvents,
+                    "listCountEventDVB":listCountEventDVB,
                     "vodCount":vodCount,
                     "vodeventos": vodEvents,
                     "catchupCount" : catchupCount,
