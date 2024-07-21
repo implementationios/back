@@ -13,8 +13,7 @@ SECRET_KEY = 'django-insecure-xtj)e3-=c-x$d!@!rozg(iif3fj8u+#sx@gr-+plox(m0-3v*v
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = False
 
-ALLOWED_HOSTS = ["*"]
-
+ALLOWED_HOSTS = ['*']
 
 # Application definition
 
@@ -27,6 +26,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'corsheaders',
     'rest_framework',
+    'django_celery_beat',
     'telemetria',
 ]
 
@@ -62,7 +62,7 @@ TEMPLATES = [
 WSGI_APPLICATION = 'backend.wsgi.application'
 
 
-# Database
+# Database xamp
 # https://docs.djangoproject.com/en/5.0/ref/settings/#databases
 
 # DATABASES = {
@@ -78,6 +78,12 @@ WSGI_APPLICATION = 'backend.wsgi.application'
 #         },
 #     }
 # }
+
+# DATABASES = {
+#     'default': dj_database_url.config(conn_max_age=600, ssl_require=True)
+# }
+
+# DATABASES sqlite3
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
@@ -114,7 +120,9 @@ TIME_ZONE = 'UTC'
 
 USE_I18N = True
 
-USE_TZ = False
+USE_L10N = True
+
+USE_TZ = True
 
 
 # Static files (CSS, JavaScript, Images)
@@ -138,3 +146,45 @@ CORS_ALLOW_HEADERS = [
     'content-type',
     'content-encoding',  # Agrega content-encoding a la lista de encabezados permitidos
 ]
+
+# Configuración de LOGGING
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'standard': {
+            'format': '%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+        },
+    },
+    'handlers': {
+        'console': {
+            'level': 'INFO',
+            'class': 'logging.StreamHandler',
+            'formatter': 'standard'
+        },
+        'file': {
+            'level': 'INFO',
+            'class': 'logging.FileHandler',
+            'filename': BASE_DIR / 'telemetria.log',
+            'formatter': 'standard',
+        },
+    },
+    'loggers': {
+        '': {
+            'handlers': ['console', 'file'],
+            'level': 'INFO',
+            'propagate': True
+        },
+    }
+}
+
+import logging.config
+logging.config.dictConfig(LOGGING)
+
+# Celery settings
+CELERY_BROKER_URL = 'redis://localhost:6379/0'  # Asumiendo que usarás Redis como broker
+CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_RESULT_SERIALIZER = 'json'
+CELERY_TIMEZONE = 'UTC'
