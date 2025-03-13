@@ -5,6 +5,7 @@ from .services import (
     fetch_and_store_telemetry,
     update_data_ott,
     update_data_dvb,
+    update_data_stop_catchup,
     update_data_end_catchup,
     update_data_stop_vod,
     update_data_end_vod,
@@ -34,6 +35,14 @@ def update_data_dvb_task():
         update_data_dvb()
     except Exception as e:
         logger.error(f"Error en update_data_dvb_task: {e}")
+        raise
+
+@shared_task
+def update_data_stop_catchup_task():
+    try:
+        update_data_stop_catchup()
+    except Exception as e:
+        logger.error(f"Error en update_data_stop_catchup_task: {e}")
         raise
 
 @shared_task
