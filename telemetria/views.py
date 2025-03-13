@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 
 # Clase para manejar la comunicación con el sistema CV
 class CVClient:
-    def __init__(self, base_url="https://pmdw-1.in.tv.br", mode="json", jsonp_timeout=5000):
+    def __init__(self, base_url="https://cv10.panaccess.com", mode="json", jsonp_timeout=5000):
         self.base_url = base_url
         self.mode = mode
         self.jsonp_timeout = jsonp_timeout
@@ -270,9 +270,9 @@ class TestFetchAndStoreTelemetry(View):
     def post(self, request, *args, **kwargs):
         try:
             # Credenciales proporcionadas para la prueba
-            username = "itv_Analitics"
-            password = "Analitics771!#"
-            cv_token = "AsGHqHpHYZiacNsAWiyS"
+            username = "yab_analitics"
+            password = "Analizar321!"
+            cv_token = "AhmLeBqnOJzPZzkeuXKa"
             limit = 1000  # Podemos reducir este límite si es necesario
             
             # Inicializar el cliente CV y realizar el login
