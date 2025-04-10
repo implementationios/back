@@ -1,4 +1,4 @@
-# services.py
+from django.http import HttpRequest
 from .views import UpdateDataOTT, UpdateDataDVB, UpdateDataStopCatchup, UpdateDataEndCatchup, UpdateDataStopVOD, UpdateDataEndVOD
 import logging
 
@@ -9,7 +9,9 @@ def fetch_and_store_telemetry():
         logger.info("Iniciando obtención y almacenamiento de datos de telemetría...")
         from .views import TestFetchAndStoreTelemetry  # Asumiendo que está en views.py
         view = TestFetchAndStoreTelemetry()
-        view.post(None)  # Simulamos una solicitud POST
+        request = HttpRequest()
+        request.method = 'POST'
+        view.post(request)
         logger.info("Datos de telemetría obtenidos y almacenados con éxito.")
     except Exception as e:
         logger.error(f"Error al obtener y almacenar datos de telemetría: {e}")

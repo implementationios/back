@@ -29,7 +29,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'corsheaders',
     'rest_framework',
-    'django_celery_beat',
+    'django_crontab', 
     'telemetria',
 ]
 
@@ -87,23 +87,23 @@ WSGI_APPLICATION = 'backend.wsgi.application'
 # Database xamp
 # https://docs.djangoproject.com/en/5.0/ref/settings/#databases
 
-#DATABASES = {
-#     'default': {
-#         'ENGINE': 'django.db.backends.mysql',
-#         'NAME': 'telemetria',
-#         'USER': 'root',
-#         'PASSWORD': '',
-#         'HOST': "127.0.0.1",
-#         'PORT': "3306",
-#         'OPTIONS': {
-#             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
-#         },
-#     }
-# }
-
 DATABASES = {
-    'default': dj_database_url.config(default=os.getenv('DATABASE_URL'))
+    'default': {
+        'ENGINE': 'django.db.backends.mysql',
+        'NAME': 'telemetria',
+        'USER': 'root',
+        'PASSWORD': '',
+        'HOST': "127.0.0.1",
+        'PORT': "3306",
+        'OPTIONS': {
+            'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
+        },
+    }
 }
+
+# DATABASES = {
+#     'default': dj_database_url.config(default=os.getenv('DATABASE_URL'))
+# }
 
 # DATABASES sqlite3
 # DATABASES = {
@@ -162,6 +162,7 @@ CORS_ALLOW_ALL_ORIGINS = True
 
 CORS_ORIGIN_WHITELIST = [
     'http://localhost:3000',
+    'https://telemetria-silk.vercel.app',
 ]
 
 CORS_ALLOW_HEADERS = [
@@ -215,11 +216,12 @@ LOGGING = {
 import logging.config
 logging.config.dictConfig(LOGGING)
 
-# Celery settings
-CELERY_BROKER_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
-CELERY_RESULT_BACKEND = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
-CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
-CELERY_ACCEPT_CONTENT = ['json']
-CELERY_TASK_SERIALIZER = 'json'
-CELERY_RESULT_SERIALIZER = 'json'
-CELERY_TIMEZONE = 'UTC'
+# Configuración de clases cron
+CRON_CLASSES = [
+    'telemetria.cron.TestFetchStoreTelemetryCronJob',
+    'telemetria.cron.UpdateDataOttCronJob',
+    'telemetria.cron.UpdateDataDvbCronJob',
+    'telemetria.cron.UpdateDataEndCatchupCronJob',
+    'telemetria.cron.UpdateDataStopVodCronJob',
+    'telemetria.cron.UpdateDataEndVodCronJob',
+]
