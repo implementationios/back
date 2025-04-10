@@ -87,23 +87,23 @@ WSGI_APPLICATION = 'backend.wsgi.application'
 # Database xamp
 # https://docs.djangoproject.com/en/5.0/ref/settings/#databases
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.mysql',
-        'NAME': 'telemetria',
-        'USER': 'root',
-        'PASSWORD': '',
-        'HOST': "127.0.0.1",
-        'PORT': "3306",
-        'OPTIONS': {
-            'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
-        },
-    }
-}
-
 # DATABASES = {
-#     'default': dj_database_url.config(default=os.getenv('DATABASE_URL'))
+#     'default': {
+#         'ENGINE': 'django.db.backends.mysql',
+#         'NAME': 'telemetria',
+#         'USER': 'root',
+#         'PASSWORD': '',
+#         'HOST': "127.0.0.1",
+#         'PORT': "3306",
+#         'OPTIONS': {
+#             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
+#         },
+#     }
 # }
+
+DATABASES = {
+    'default': dj_database_url.config(default=os.getenv('DATABASE_URL'))
+}
 
 # DATABASES sqlite3
 # DATABASES = {
