@@ -216,98 +216,107 @@ def store_telemetry_data(data_batch):
     logger.info(f"Total processed: {total_processed}, Total invalid: {total_invalid}")
     return total_processed, total_invalid
 
-# Función para obtener todos los datos de telemetría con paginación
-def fetch_all_data(client, limit):
+# Función para obtener todos los datos de telemetría con paginación y guardarlos directamente
+def fetch_and_store_data_streaming(client, limit):
     currentPage = 0
-    allTelemetryData = []
+    total_processed = 0
+    total_invalid = 0
 
     while True:
         result = client.get_list_of_telemetry_records(currentPage, limit)
         if not result.get("success"):
             raise Exception(f"Error al obtener datos: {result.get('errorMessage')}")
-        
+
         data = result.get("answer", {}).get("telemetryRecordEntries", [])
         if not data:
             break
-        
-        allTelemetryData.extend(data)
+
+        logger.info(f"Fetched {len(data)} records in page {currentPage}")
+        processed_data = extract_timestamp_details(data)
+        processed, invalid = store_telemetry_data(processed_data)
+        total_processed += processed
+        total_invalid += invalid
+
         currentPage += limit
 
-    return allTelemetryData
+    return total_processed, total_invalid
 
 # Función para obtener datos de telemetría hasta un recordId específico
 def fetch_data_up_to(client, highestRecordId, limit):
     currentPage = 0
-    allTelemetryData = []
+    total_processed = 0
+    total_invalid = 0
     foundRecord = False
 
     while True:
         result = client.get_list_of_telemetry_records(currentPage, limit)
         if not result.get("success"):
             raise Exception(f"Error al obtener datos: {result.get('errorMessage')}")
-        
+
         data = result.get("answer", {}).get("telemetryRecordEntries", [])
         if not data:
             break
-        
+
+        filtered_data = []
         for record in data:
             if record["recordId"] == highestRecordId:
                 foundRecord = True
                 break
-            allTelemetryData.append(record)
-        
+            filtered_data.append(record)
+
+        if filtered_data:
+            logger.info(f"Processing {len(filtered_data)} records from page {currentPage}")
+            processed_data = extract_timestamp_details(filtered_data)
+            processed, invalid = store_telemetry_data(processed_data)
+            total_processed += processed
+            total_invalid += invalid
+
         if foundRecord:
             break
-        
+
         currentPage += limit
 
-    return allTelemetryData
+    return total_processed, total_invalid
 
 # Funcion para hacer la consulta al CV de telemetry y obtener todos los datos
 @method_decorator(csrf_exempt, name='dispatch')
 class TestFetchAndStoreTelemetry(View):
     permission_classes = [AllowAny]
+
     def post(self, request, *args, **kwargs):
         try:
-            # Credenciales proporcionadas para la prueba
+            # Credenciales
             username = "yab_analitics"
             password = "Analizar321!"
             cv_token = "AhmLeBqnOJzPZzkeuXKa"
-            limit = 1000  # Podemos reducir este límite si es necesario
-            
-            # Inicializar el cliente CV y realizar el login
+            limit = 100  # Reducido para menor uso de memoria
+
+            # Login en CV
             client = CVClient()
             success, error_message = client.login(cv_token, username, password)
-           
             if not success:
                 return JsonResponse({"error": error_message}, status=400)
-           
-            # Verificar si la base de datos está vacía
+
+            # Verificación base de datos
             if is_database_empty():
-                data = fetch_all_data(client, limit)
                 message = "Fetched all data"
+                total_processed, total_invalid = fetch_and_store_data_streaming(client, limit)
             else:
                 highest_record = Telemetria.objects.order_by('-recordId').first()
                 highestRecordId = highest_record.recordId if highest_record else None
-                data = fetch_data_up_to(client, highestRecordId, limit)
+                total_processed, total_invalid = fetch_data_up_to(client, highestRecordId, limit)
                 message = "Fetched data up to highest recordId"
-
-            # Procesar datos para agregar fecha y hora
-            processed_data = extract_timestamp_details(data)
-            
-            # Almacenar los datos en la base de datos
-            total_processed, total_invalid = store_telemetry_data(processed_data)
 
             return JsonResponse({
                 "message": message,
                 "total_processed": total_processed,
-                "total_invalid": total_invalid,
-                "data_count": len(processed_data)
+                "total_invalid": total_invalid
             })
-       
+
         except Exception as e:
             logger.error(f"Unexpected error: {e}")
             return JsonResponse({"error": str(e)}, status=500)
+
 
 #--------------------------------------------------------------------------------#
 
@@ -328,6 +337,7 @@ def timeit(func):
 class UpdateDataOTT(APIView):
     """
     API para actualizar los datos en la tabla MergedTelemetricOTT fusionando registros de Telemetria.
+    Optimizada para bajo uso de memoria en Heroku (evita R14).
     """
 
     @staticmethod
@@ -340,41 +350,33 @@ class UpdateDataOTT(APIView):
         return {key: value for key, value in data.items() if key in valid_fields}
 
     @staticmethod
-    def data_ott():
+    def data_ott_stream():
         """
-        Fusiona solo el campo `dataName` para los registros de actionId=8
-        que tienen el mismo `dataId` en los registros de actionId=7.
+        Fusiona solo el campo `dataName` para registros de actionId=8 usando los registros con actionId=7.
+        Utiliza streams para bajo consumo de RAM.
         """
         try:
-            # Obtener datos filtrados en una sola consulta
-            telemetria_data = Telemetria.objects.filter(actionId__in=[7, 8])
+            # Diccionario con dataId -> dataName para actionId=7
+            actionid7_dict = dict(
+                Telemetria.objects
+                .filter(actionId=7, dataId__isnull=False)
+                .values_list('dataId', 'dataName')
+            )
 
-            # Diccionario para mapear dataId -> dataName de actionId=7
-            actionid7_dict = {item.dataId: item.dataName for item in telemetria_data if item.actionId == 7 and item.dataId}
-
-            # Lista para almacenar datos fusionados
-            merged_data = []
-
-            for item in telemetria_data:
-                # Verificar si el registro es de actionId=8 y su dataId tiene un dataName correspondiente en actionId=7
-                if item.actionId == 8 and item.dataId in actionid7_dict:
-                    # Fusionar solo el campo `dataName`
+            # Iterar solo los registros actionId=8, evitando carga completa
+            for item in Telemetria.objects.filter(actionId=8).iterator():
+                if item.dataId in actionid7_dict:
                     item.dataName = actionid7_dict[item.dataId]
-
-                # Agregar el registro, modificado o no, a la lista final
-                merged_data.append(item)
-
-            return merged_data
+                yield item
 
         except Exception as e:
-            logger.error(f"Error en data_ott: {e}")
+            logger.error(f"Error en data_ott_stream: {e}")
             return []
 
-
     @staticmethod
-    def bulk_insert_merged_data(records, batch_size=500):
+    def bulk_insert_merged_data(records, batch_size=100):
         """
-        Inserta los registros en MergedTelemetricOTT en lotes de batch_size para optimizar la inserción.
+        Inserta registros en MergedTelemetricOTT en lotes (batch_size) para evitar exceso de memoria.
         """
         if records:
             for i in range(0, len(records), batch_size):
@@ -384,32 +386,36 @@ class UpdateDataOTT(APIView):
     def post(self, request):
         """
         Maneja la solicitud POST para actualizar los datos de MergedTelemetricOTT.
+        Procesa datos por lotes para evitar errores R14 en Heroku.
         """
         try:
-            # Obtener datos fusionados
-            merged_data = self.data_ott()
-
-            if not merged_data:
-                return Response({"message": "No hay datos para actualizar"}, status=status.HTTP_200_OK)
-
-            # Obtener el máximo recordId existente en la tabla destino
+            # Máximo recordId existente en destino
             id_maximo_registro = MergedTelemetricOTT.objects.aggregate(max_record=Max('recordId'))['max_record'] or 0
 
-            # Filtrar los registros nuevos
-            registros_filtrados = [
-                MergedTelemetricOTT(**self.get_valid_fields(record.__dict__))
-                for record in merged_data
-                if record.recordId and record.recordId > id_maximo_registro
-            ]
+            registros_filtrados = []
+            total_insertados = 0
 
-            # Verificar si hay nuevos registros
-            if not registros_filtrados:
+            for record in self.data_ott_stream():
+                if record.recordId and record.recordId > id_maximo_registro:
+                    fields = self.get_valid_fields(record.__dict__)
+                    nuevo = MergedTelemetricOTT(**fields)
+                    registros_filtrados.append(nuevo)
+
+                    # Insertar por lotes
+                    if len(registros_filtrados) >= 100:
+                        self.bulk_insert_merged_data(registros_filtrados)
+                        total_insertados += len(registros_filtrados)
+                        registros_filtrados = []
+
+            # Insertar registros restantes
+            if registros_filtrados:
+                self.bulk_insert_merged_data(registros_filtrados)
+                total_insertados += len(registros_filtrados)
+
+            if total_insertados == 0:
                 return Response({"message": "No hay nuevos registros para crear"}, status=status.HTTP_200_OK)
 
-            with transaction.atomic():
-                self.bulk_insert_merged_data(registros_filtrados)
-
-            return Response({"message": "Inserción exitosa"}, status=status.HTTP_200_OK)
+            return Response({"message": f"Inserción exitosa ({total_insertados} registros)"}, status=status.HTTP_200_OK)
 
         except IntegrityError as e:
             logger.error(f"Error de integridad en UpdateDataOTT: {e}")
@@ -428,12 +434,8 @@ class UpdateDataOTT(APIView):
         Maneja la solicitud GET para obtener todos los datos de MergedTelemetricOTT.
         """
         try:
-            # Obtiene todos los objetos de la tabla MergedTelemetricOTT en la base de datos
             data = MergedTelemetricOTT.objects.all()
-
-            # Serializa los datos obtenidos utilizando el serializador correspondiente
             serializer = MergedTelemetricOTTSerializer(data, many=True)
-
             return Response(serializer.data, status=status.HTTP_200_OK)
 
         except Exception as e:
@@ -444,57 +446,39 @@ class UpdateDataOTT(APIView):
 class UpdateDataDVB(APIView):
     """
     API para actualizar los datos en la tabla MergedTelemetricDVB fusionando registros de Telemetria.
+    Optimizada para bajo consumo de memoria (evita error R14).
     """
 
     @staticmethod
     def get_valid_fields(data):
-        """
-        Filtra los campos no válidos del diccionario `data` y devuelve un diccionario
-        con solo los campos válidos del modelo MergedTelemetricDVB.
-        """
         valid_fields = {field.name for field in MergedTelemetricDVB._meta.get_fields()}
         return {key: value for key, value in data.items() if key in valid_fields}
 
     @staticmethod
-    def dataDVB():
+    def data_dvb_stream():
         """
-        Fusiona solo el campo `dataName` para los registros de actionId=6
-        que tienen el mismo `dataId` en los registros de actionId=5.
+        Generador que fusiona dataName de registros con actionId=5 en los registros con actionId=6.
         """
         try:
-            # Obtener todos los registros con actionId=5 y actionId=6
-            telemetria_data = Telemetria.objects.filter(actionId__in=[5, 6])
+            # Diccionario con dataId -> dataName de actionId=5
+            actionid5_dict = dict(
+                Telemetria.objects
+                .filter(actionId=5, dataId__isnull=False)
+                .values_list('dataId', 'dataName')
+            )
 
-            # Diccionario para mapear dataId -> dataName de actionId=5
-            actionid5_dict = {
-                item.dataId: item.dataName
-                for item in telemetria_data
-                if item.actionId == 5 and item.dataId
-            }
-
-            # Lista para almacenar registros de actionId=6 con modificaciones en dataName
-            updated_data = []
-
-            for item in telemetria_data:
-                if item.actionId == 6:
-                    # Si el dataId existe en actionId=5, tomar el dataName correspondiente
-                    if item.dataId in actionid5_dict and not item.dataName:
-                        item.dataName = actionid5_dict[item.dataId]
-
-                    # Agregar el registro de actionId=6 (modificado o no) a la lista final
-                    updated_data.append(item)
-
-            return updated_data
+            # Iterar por los registros de actionId=6 (streaming)
+            for item in Telemetria.objects.filter(actionId=6).iterator():
+                if item.dataId in actionid5_dict and not item.dataName:
+                    item.dataName = actionid5_dict[item.dataId]
+                yield item
 
         except Exception as e:
-            logger.error(f"Error en dataDVB: {e}")
+            logger.error(f"Error en data_dvb_stream: {e}")
             return []
 
     @staticmethod
-    def bulk_insert_merged_data(records, batch_size=500):
-        """
-        Inserta los registros en MergedTelemetricDVB en lotes de batch_size para optimizar la inserción.
-        """
+    def bulk_insert_merged_data(records, batch_size=100):
         if records:
             for i in range(0, len(records), batch_size):
                 batch = records[i:i + batch_size]
@@ -502,34 +486,32 @@ class UpdateDataDVB(APIView):
 
     def post(self, request):
         """
-        Maneja la solicitud POST para actualizar los datos de MergedTelemetricDVB.
+        Maneja la solicitud POST para actualizar MergedTelemetricDVB con bajo consumo de RAM.
         """
         try:
-            # Obtener registros de actionId=6 con dataName fusionado
-            updated_data = self.dataDVB()
-
-            if not updated_data:
-                return Response({"message": "No hay datos para actualizar"}, status=status.HTTP_200_OK)
-
-            # Obtener el máximo recordId existente en la tabla destino
             id_maximo_registro = MergedTelemetricDVB.objects.aggregate(max_record=Max('recordId'))['max_record'] or 0
+            registros_filtrados = []
+            total_insertados = 0
 
-            # Filtrar los registros de actionId=6 que tengan recordId mayor al máximo existente
-            registros_filtrados = [
-                MergedTelemetricDVB(**self.get_valid_fields(record.__dict__))
-                for record in updated_data
-                if record.recordId and record.recordId > id_maximo_registro
-            ]
+            for record in self.data_dvb_stream():
+                if record.recordId and record.recordId > id_maximo_registro:
+                    nuevo = MergedTelemetricDVB(**self.get_valid_fields(record.__dict__))
+                    registros_filtrados.append(nuevo)
 
-            # Verificar si hay registros nuevos para insertar
-            if not registros_filtrados:
+                    if len(registros_filtrados) >= 100:
+                        self.bulk_insert_merged_data(registros_filtrados)
+                        total_insertados += len(registros_filtrados)
+                        registros_filtrados = []
+
+            # Insertar los que queden
+            if registros_filtrados:
+                self.bulk_insert_merged_data(registros_filtrados)
+                total_insertados += len(registros_filtrados)
+
+            if total_insertados == 0:
                 return Response({"message": "No hay nuevos registros para crear"}, status=status.HTTP_200_OK)
 
-            # Insertar los registros en MergedTelemetricDVB
-            with transaction.atomic():
-                self.bulk_insert_merged_data(registros_filtrados)
-
-            return Response({"message": "Inserción exitosa"}, status=status.HTTP_200_OK)
+            return Response({"message": f"Inserción exitosa ({total_insertados} registros)"}, status=status.HTTP_200_OK)
 
         except IntegrityError as e:
             logger.error(f"Error de integridad en UpdateDataDVB: {e}")
@@ -544,18 +526,10 @@ class UpdateDataDVB(APIView):
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     def get(self, request, *args, **kwargs):
-        """
-        Maneja la solicitud GET para obtener todos los datos de MergedTelemetricDVB.
-        """
         try:
-            # Obtiene todos los objetos de la tabla MergedTelemetricDVB en la base de datos
             data = MergedTelemetricDVB.objects.all()
-
-            # Serializa los datos obtenidos utilizando el serializador correspondiente
             serializer = MergedTelemetricDVBSerializer(data, many=True)
-
             return Response(serializer.data, status=status.HTTP_200_OK)
-
         except Exception as e:
             logger.error(f"Error en GET UpdateDataDVB: {e}")
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -563,52 +537,37 @@ class UpdateDataDVB(APIView):
 ## actualización de los datos de catchup pausado
 class UpdateDataStopCatchup(APIView):
     """
-    API para actualizar los datos en la tabla MergedTelemetricStopCatchup fusionando registros de Telemetria.
+    API optimizada para actualizar la tabla MergedTelemetricStopCatchup con bajo uso de RAM (previene R14).
     """
 
     @staticmethod
     def get_valid_fields(data):
-        """
-        Filtra los campos no válidos del diccionario `data` y devuelve un diccionario
-        con solo los campos válidos del modelo MergedTelemetricStopCatchup.
-        """
         valid_fields = {field.name for field in MergedTelemetricStopCatchup._meta.get_fields()}
         return {key: value for key, value in data.items() if key in valid_fields}
 
     @staticmethod
-    def dataStop():
+    def data_stop_stream():
         """
-        Fusiona solo el campo `dataName` para los registros de actionId=17
-        que tienen el mismo `dataId` en los registros de actionId=16.
+        Generador que fusiona dataName de registros con actionId=16 en registros con actionId=17.
         """
         try:
-            telemetria_data = Telemetria.objects.filter(actionId__in=[16, 17])
+            actionid16_dict = dict(
+                Telemetria.objects
+                .filter(actionId=16, dataId__isnull=False)
+                .values_list('dataId', 'dataName')
+            )
 
-            actionid16_dict = {
-                item.dataId: item.dataName
-                for item in telemetria_data
-                if item.actionId == 16 and item.dataId
-            }
-
-            updated_data = []
-
-            for item in telemetria_data:
-                if item.actionId == 17:
-                    if item.dataId in actionid16_dict and not item.dataName:
-                        item.dataName = actionid16_dict[item.dataId]
-                    updated_data.append(item)
-
-            return updated_data
+            for item in Telemetria.objects.filter(actionId=17).iterator():
+                if item.dataId in actionid16_dict and not item.dataName:
+                    item.dataName = actionid16_dict[item.dataId]
+                yield item
 
         except Exception as e:
-            logger.error(f"Error en dataStop: {e}")
+            logger.error(f"Error en data_stop_stream: {e}")
             return []
 
     @staticmethod
-    def bulk_insert_merged_data(records, batch_size=500):
-        """
-        Inserta los registros en MergedTelemetricStopCatchup en lotes de batch_size para optimizar la inserción.
-        """
+    def bulk_insert_merged_data(records, batch_size=100):
         if records:
             for i in range(0, len(records), batch_size):
                 batch = records[i:i + batch_size]
@@ -616,29 +575,31 @@ class UpdateDataStopCatchup(APIView):
 
     def post(self, request):
         """
-        Maneja la solicitud POST para actualizar los datos de MergedTelemetricStopCatchup.
+        POST: Inserta registros nuevos fusionados a partir de registros con actionId=17.
         """
         try:
-            merged_data = self.dataStop()
-
-            if not merged_data:
-                return Response({"message": "No hay datos para actualizar"}, status=status.HTTP_200_OK)
-
             id_maximo_registro = MergedTelemetricStopCatchup.objects.aggregate(max_record=Max('recordId'))['max_record'] or 0
+            registros_filtrados = []
+            total_insertados = 0
 
-            registros_filtrados = [
-                MergedTelemetricStopCatchup(**self.get_valid_fields(record.__dict__))
-                for record in merged_data
-                if record.recordId and record.recordId > id_maximo_registro
-            ]
+            for record in self.data_stop_stream():
+                if record.recordId and record.recordId > id_maximo_registro:
+                    nuevo = MergedTelemetricStopCatchup(**self.get_valid_fields(record.__dict__))
+                    registros_filtrados.append(nuevo)
 
-            if not registros_filtrados:
+                    if len(registros_filtrados) >= 100:
+                        self.bulk_insert_merged_data(registros_filtrados)
+                        total_insertados += len(registros_filtrados)
+                        registros_filtrados = []
+
+            if registros_filtrados:
+                self.bulk_insert_merged_data(registros_filtrados)
+                total_insertados += len(registros_filtrados)
+
+            if total_insertados == 0:
                 return Response({"message": "No hay nuevos registros para crear"}, status=status.HTTP_200_OK)
 
-            with transaction.atomic():
-                self.bulk_insert_merged_data(registros_filtrados)
-
-            return Response({"message": "Inserción exitosa"}, status=status.HTTP_200_OK)
+            return Response({"message": f"Inserción exitosa ({total_insertados} registros)"}, status=status.HTTP_200_OK)
 
         except IntegrityError as e:
             logger.error(f"Error de integridad en UpdateDataStopCatchup: {e}")
@@ -652,74 +613,53 @@ class UpdateDataStopCatchup(APIView):
             logger.exception(f"Error inesperado en UpdateDataStopCatchup: {e}")
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-
     def get(self, request, *args, **kwargs):
-            """
-            Maneja la solicitud GET para obtener todos los datos de MergedTelemetricStopCatchup.
-            """
-            try:
-                # Obtiene todos los objetos de la tabla MergedTelemetricStopCatchup
-                data = MergedTelemetricStopCatchup.objects.all()
-
-                # Serializa los datos obtenidos utilizando el serializador correspondiente
-                serializer = MergedTelemetricStopCatchupSerializer(data, many=True)
-
-                return Response(serializer.data, status=status.HTTP_200_OK)
-
-            except Exception as e:
-                logger.error(f"Error en GET UpdateDataStopCatchup: {e}")
-                return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        """
+        GET: Devuelve todos los registros actuales en MergedTelemetricStopCatchup.
+        """
+        try:
+            data = MergedTelemetricStopCatchup.objects.all()
+            serializer = MergedTelemetricStopCatchupSerializer(data, many=True)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        except Exception as e:
+            logger.error(f"Error en GET UpdateDataStopCatchup: {e}")
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 ## actualización de los datos de catchup terminado
 class UpdateDataEndCatchup(APIView):
     """
-    API para actualizar y obtener los datos en la tabla MergedTelemetricEndCatchup
-    fusionando registros de Telemetria.
+    API para actualizar la tabla MergedTelemetricEndCatchup sin riesgo de R14.
     """
 
     @staticmethod
     def get_valid_fields(data):
-        """
-        Filtra los campos no válidos del diccionario `data` y devuelve un diccionario
-        con solo los campos válidos del modelo MergedTelemetricEndCatchup.
-        """
         valid_fields = {field.name for field in MergedTelemetricEndCatchup._meta.get_fields()}
         return {key: value for key, value in data.items() if key in valid_fields}
 
     @staticmethod
-    def dataEnd():
+    def data_end_stream():
         """
-        Fusiona solo el campo `dataName` para los registros de actionId=18
-        que tienen el mismo `dataId` en los registros de actionId=16.
+        Fusiona el campo dataName de registros actionId=16 en los registros actionId=18.
+        Procesa en streaming para evitar uso excesivo de RAM.
         """
         try:
-            telemetria_data = Telemetria.objects.filter(actionId__in=[16, 18])
+            actionid16_dict = dict(
+                Telemetria.objects
+                .filter(actionId=16, dataId__isnull=False)
+                .values_list('dataId', 'dataName')
+            )
 
-            actionid16_dict = {
-                item.dataId: item.dataName
-                for item in telemetria_data
-                if item.actionId == 16 and item.dataId
-            }
-
-            updated_data = []
-
-            for item in telemetria_data:
-                if item.actionId == 18:
-                    if item.dataId in actionid16_dict and not item.dataName:
-                        item.dataName = actionid16_dict[item.dataId]
-                    updated_data.append(item)
-
-            return updated_data
+            for item in Telemetria.objects.filter(actionId=18).iterator():
+                if item.dataId in actionid16_dict and not item.dataName:
+                    item.dataName = actionid16_dict[item.dataId]
+                yield item
 
         except Exception as e:
-            logger.error(f"Error en dataEnd: {e}")
+            logger.error(f"Error en data_end_stream: {e}")
             return []
 
     @staticmethod
-    def bulk_insert_merged_data(records, batch_size=500):
-        """
-        Inserta los registros en MergedTelemetricEndCatchup en lotes de batch_size para optimizar la inserción.
-        """
+    def bulk_insert_merged_data(records, batch_size=100):
         if records:
             for i in range(0, len(records), batch_size):
                 batch = records[i:i + batch_size]
@@ -727,29 +667,31 @@ class UpdateDataEndCatchup(APIView):
 
     def post(self, request):
         """
-        Maneja la solicitud POST para actualizar los datos de MergedTelemetricEndCatchup.
+        POST: Inserta registros fusionados en MergedTelemetricEndCatchup usando streaming y lotes.
         """
         try:
-            merged_data = self.dataEnd()
-
-            if not merged_data:
-                return Response({"message": "No hay datos para actualizar"}, status=status.HTTP_200_OK)
-
             id_maximo_registro = MergedTelemetricEndCatchup.objects.aggregate(max_record=Max('recordId'))['max_record'] or 0
+            registros_filtrados = []
+            total_insertados = 0
 
-            registros_filtrados = [
-                MergedTelemetricEndCatchup(**self.get_valid_fields(record.__dict__))
-                for record in merged_data
-                if record.recordId and record.recordId > id_maximo_registro
-            ]
+            for record in self.data_end_stream():
+                if record.recordId and record.recordId > id_maximo_registro:
+                    nuevo = MergedTelemetricEndCatchup(**self.get_valid_fields(record.__dict__))
+                    registros_filtrados.append(nuevo)
 
-            if not registros_filtrados:
+                    if len(registros_filtrados) >= 100:
+                        self.bulk_insert_merged_data(registros_filtrados)
+                        total_insertados += len(registros_filtrados)
+                        registros_filtrados = []
+
+            if registros_filtrados:
+                self.bulk_insert_merged_data(registros_filtrados)
+                total_insertados += len(registros_filtrados)
+
+            if total_insertados == 0:
                 return Response({"message": "No hay nuevos registros para crear"}, status=status.HTTP_200_OK)
 
-            with transaction.atomic():
-                self.bulk_insert_merged_data(registros_filtrados)
-
-            return Response({"message": "Inserción exitosa"}, status=status.HTTP_200_OK)
+            return Response({"message": f"Inserción exitosa ({total_insertados} registros)"}, status=status.HTTP_200_OK)
 
         except IntegrityError as e:
             logger.error(f"Error de integridad en UpdateDataEndCatchup: {e}")
@@ -765,17 +707,12 @@ class UpdateDataEndCatchup(APIView):
 
     def get(self, request, *args, **kwargs):
         """
-        Maneja la solicitud GET para obtener todos los datos de MergedTelemetricEndCatchup.
+        GET: Devuelve todos los registros de MergedTelemetricEndCatchup.
         """
         try:
-            # Obtiene todos los objetos de la tabla MergedTelemetricEndCatchup en la base de datos
             data = MergedTelemetricEndCatchup.objects.all()
-
-            # Serializa los datos obtenidos utilizando el serializador correspondiente
             serializer = MergedTelemetricEndCatchupSerializer(data, many=True)
-
             return Response(serializer.data, status=status.HTTP_200_OK)
-
         except Exception as e:
             logger.error(f"Error en GET UpdateDataEndCatchup: {e}")
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -783,52 +720,38 @@ class UpdateDataEndCatchup(APIView):
 ## actualización de los datos de VOD pausados
 class UpdateDataStopVOD(APIView):
     """
-    API para actualizar y obtener los datos de la tabla MergedTelemetricStopVOD fusionando registros de Telemetria.
+    API optimizada para actualizar la tabla MergedTelemetricStopVOD sin riesgo de R14.
     """
 
     @staticmethod
     def get_valid_fields(data):
-        """
-        Filtra los campos no válidos del diccionario `data` y devuelve un diccionario
-        con solo los campos válidos del modelo MergedTelemetricStopVOD.
-        """
         valid_fields = {field.name for field in MergedTelemetricStopVOD._meta.get_fields()}
         return {key: value for key, value in data.items() if key in valid_fields}
 
     @staticmethod
-    def dataStop():
+    def data_stop_stream():
         """
-        Fusiona solo el campo `dataName` para los registros de actionId=14
-        que tienen el mismo `dataId` en los registros de actionId=13.
+        Generador que fusiona dataName de registros actionId=13 en los registros actionId=14.
+        Procesa en streaming para evitar uso excesivo de RAM.
         """
         try:
-            telemetria_data = Telemetria.objects.filter(actionId__in=[13, 14])
+            actionid13_dict = dict(
+                Telemetria.objects
+                .filter(actionId=13, dataId__isnull=False)
+                .values_list('dataId', 'dataName')
+            )
 
-            actionid13_dict = {
-                item.dataId: item.dataName
-                for item in telemetria_data
-                if item.actionId == 13 and item.dataId
-            }
-
-            updated_data = []
-
-            for item in telemetria_data:
-                if item.actionId == 14:
-                    if item.dataId in actionid13_dict and not item.dataName:
-                        item.dataName = actionid13_dict[item.dataId]
-                    updated_data.append(item)
-
-            return updated_data
+            for item in Telemetria.objects.filter(actionId=14).iterator():
+                if item.dataId in actionid13_dict and not item.dataName:
+                    item.dataName = actionid13_dict[item.dataId]
+                yield item
 
         except Exception as e:
-            logger.error(f"Error en dataStop: {e}")
+            logger.error(f"Error en data_stop_stream: {e}")
             return []
 
     @staticmethod
-    def bulk_insert_merged_data(records, batch_size=500):
-        """
-        Inserta los registros en MergedTelemetricStopVOD en lotes de batch_size para optimizar la inserción.
-        """
+    def bulk_insert_merged_data(records, batch_size=100):
         if records:
             for i in range(0, len(records), batch_size):
                 batch = records[i:i + batch_size]
@@ -836,29 +759,31 @@ class UpdateDataStopVOD(APIView):
 
     def post(self, request):
         """
-        Maneja la solicitud POST para actualizar los datos de MergedTelemetricStopVOD.
+        POST: Inserta registros fusionados en MergedTelemetricStopVOD usando streaming y lotes.
         """
         try:
-            merged_data = self.dataStop()
-
-            if not merged_data:
-                return Response({"message": "No hay datos para actualizar"}, status=status.HTTP_200_OK)
-
             id_maximo_registro = MergedTelemetricStopVOD.objects.aggregate(max_record=Max('recordId'))['max_record'] or 0
+            registros_filtrados = []
+            total_insertados = 0
 
-            registros_filtrados = [
-                MergedTelemetricStopVOD(**self.get_valid_fields(record.__dict__))
-                for record in merged_data
-                if record.recordId and record.recordId > id_maximo_registro
-            ]
+            for record in self.data_stop_stream():
+                if record.recordId and record.recordId > id_maximo_registro:
+                    nuevo = MergedTelemetricStopVOD(**self.get_valid_fields(record.__dict__))
+                    registros_filtrados.append(nuevo)
 
-            if not registros_filtrados:
+                    if len(registros_filtrados) >= 100:
+                        self.bulk_insert_merged_data(registros_filtrados)
+                        total_insertados += len(registros_filtrados)
+                        registros_filtrados = []
+
+            if registros_filtrados:
+                self.bulk_insert_merged_data(registros_filtrados)
+                total_insertados += len(registros_filtrados)
+
+            if total_insertados == 0:
                 return Response({"message": "No hay nuevos registros para crear"}, status=status.HTTP_200_OK)
 
-            with transaction.atomic():
-                self.bulk_insert_merged_data(registros_filtrados)
-
-            return Response({"message": "Inserción exitosa"}, status=status.HTTP_200_OK)
+            return Response({"message": f"Inserción exitosa ({total_insertados} registros)"}, status=status.HTTP_200_OK)
 
         except IntegrityError as e:
             logger.error(f"Error de integridad en UpdateDataStopVOD: {e}")
@@ -874,17 +799,12 @@ class UpdateDataStopVOD(APIView):
 
     def get(self, request, *args, **kwargs):
         """
-        Maneja la solicitud GET para obtener todos los datos de MergedTelemetricStopVOD.
+        GET: Devuelve todos los registros de MergedTelemetricStopVOD.
         """
         try:
-            # Obtiene todos los objetos de la tabla MergedTelemetricStopVOD en la base de datos
             data = MergedTelemetricStopVOD.objects.all()
-
-            # Serializa los datos obtenidos utilizando el serializador correspondiente
             serializer = MergedTelemetricStopVODSerializer(data, many=True)
-
             return Response(serializer.data, status=status.HTTP_200_OK)
-
         except Exception as e:
             logger.error(f"Error en GET UpdateDataStopVOD: {e}")
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -892,52 +812,38 @@ class UpdateDataStopVOD(APIView):
 # ## actualización de los datos de VOD terminado
 class UpdateDataEndVOD(APIView):
     """
-    API para actualizar y obtener los datos de la tabla MergedTelemetricEndVOD fusionando registros de Telemetria.
+    API optimizada para actualizar MergedTelemetricEndVOD sin riesgo de R14.
     """
 
     @staticmethod
     def get_valid_fields(data):
-        """
-        Filtra los campos no válidos del diccionario `data` y devuelve un diccionario
-        con solo los campos válidos del modelo MergedTelemetricEndVOD.
-        """
         valid_fields = {field.name for field in MergedTelemetricEndVOD._meta.get_fields()}
         return {key: value for key, value in data.items() if key in valid_fields}
 
     @staticmethod
-    def dataEnd():
+    def data_end_stream():
         """
-        Fusiona solo el campo `dataName` para los registros de actionId=15
-        que tienen el mismo `dataId` en los registros de actionId=13.
+        Generador que fusiona dataName de registros actionId=13 en registros actionId=15.
+        Procesamiento por streaming.
         """
         try:
-            telemetria_data = Telemetria.objects.filter(actionId__in=[13, 15])
+            actionid13_dict = dict(
+                Telemetria.objects
+                .filter(actionId=13, dataId__isnull=False)
+                .values_list('dataId', 'dataName')
+            )
 
-            actionid13_dict = {
-                item.dataId: item.dataName
-                for item in telemetria_data
-                if item.actionId == 13 and item.dataId
-            }
-
-            updated_data = []
-
-            for item in telemetria_data:
-                if item.actionId == 15:
-                    if item.dataId in actionid13_dict and not item.dataName:
-                        item.dataName = actionid13_dict[item.dataId]
-                    updated_data.append(item)
-
-            return updated_data
+            for item in Telemetria.objects.filter(actionId=15).iterator():
+                if item.dataId in actionid13_dict and not item.dataName:
+                    item.dataName = actionid13_dict[item.dataId]
+                yield item
 
         except Exception as e:
-            logger.error(f"Error en dataEnd: {e}")
+            logger.error(f"Error en data_end_stream: {e}")
             return []
 
     @staticmethod
-    def bulk_insert_merged_data(records, batch_size=500):
-        """
-        Inserta los registros en MergedTelemetricEndVOD en lotes de batch_size para optimizar la inserción.
-        """
+    def bulk_insert_merged_data(records, batch_size=100):
         if records:
             for i in range(0, len(records), batch_size):
                 batch = records[i:i + batch_size]
@@ -945,29 +851,31 @@ class UpdateDataEndVOD(APIView):
 
     def post(self, request):
         """
-        Maneja la solicitud POST para actualizar los datos de MergedTelemetricEndVOD.
+        POST: Inserta registros fusionados en MergedTelemetricEndVOD en lotes seguros.
         """
         try:
-            merged_data = self.dataEnd()
-
-            if not merged_data:
-                return Response({"message": "No hay datos para actualizar"}, status=status.HTTP_200_OK)
-
             id_maximo_registro = MergedTelemetricEndVOD.objects.aggregate(max_record=Max('recordId'))['max_record'] or 0
+            registros_filtrados = []
+            total_insertados = 0
 
-            registros_filtrados = [
-                MergedTelemetricEndVOD(**self.get_valid_fields(record.__dict__))
-                for record in merged_data
-                if record.recordId and record.recordId > id_maximo_registro
-            ]
+            for record in self.data_end_stream():
+                if record.recordId and record.recordId > id_maximo_registro:
+                    nuevo = MergedTelemetricEndVOD(**self.get_valid_fields(record.__dict__))
+                    registros_filtrados.append(nuevo)
 
-            if not registros_filtrados:
+                    if len(registros_filtrados) >= 100:
+                        self.bulk_insert_merged_data(registros_filtrados)
+                        total_insertados += len(registros_filtrados)
+                        registros_filtrados = []
+
+            if registros_filtrados:
+                self.bulk_insert_merged_data(registros_filtrados)
+                total_insertados += len(registros_filtrados)
+
+            if total_insertados == 0:
                 return Response({"message": "No hay nuevos registros para crear"}, status=status.HTTP_200_OK)
 
-            with transaction.atomic():
-                self.bulk_insert_merged_data(registros_filtrados)
-
-            return Response({"message": "Inserción exitosa"}, status=status.HTTP_200_OK)
+            return Response({"message": f"Inserción exitosa ({total_insertados} registros)"}, status=status.HTTP_200_OK)
 
         except IntegrityError as e:
             logger.error(f"Error de integridad en UpdateDataEndVOD: {e}")
@@ -983,1755 +891,317 @@ class UpdateDataEndVOD(APIView):
 
     def get(self, request, *args, **kwargs):
         """
-        Maneja la solicitud GET para obtener todos los datos de MergedTelemetricEndVOD.
+        GET: Devuelve todos los registros de MergedTelemetricEndVOD.
         """
         try:
-            # Obtiene todos los objetos de la tabla MergedTelemetricEndVOD en la base de datos
             data = MergedTelemetricEndVOD.objects.all()
-
-            # Serializa los datos obtenidos utilizando el serializador correspondiente
             serializer = MergedTelemetricEndVODSerializer(data, many=True)
-
             return Response(serializer.data, status=status.HTTP_200_OK)
-
         except Exception as e:
             logger.error(f"Error en GET UpdateDataEndVOD: {e}")
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 class TelemetriaDaysOTT(APIView):
-    # permission_classes = [IsAuthenticated]
-    @staticmethod
-    def get_filtered_data(days):  # Añadido @staticmethod
+    def get_filtered_data(self, days):
         """
-        Filtra los datos del modelo MergedTelemetricOTT según el rango de días proporcionado.
+        Devuelve un iterador sobre los registros del modelo MergedTelemetricOTT
+        filtrados por el rango de fechas correspondiente a los últimos `days` días.
+        Si `days` es 0 o negativo, devuelve todos los registros.
         """
         try:
+            today = datetime.now().date()
             if days > 0:
-                today = datetime.now().date()
                 start_date = today - timedelta(days=days)
-                return MergedTelemetricOTT.objects.filter(dataDate__range=[start_date, today])
-            else:
-                return MergedTelemetricOTT.objects.all()
+                return MergedTelemetricOTT.objects.filter(dataDate__range=[start_date, today]).iterator()
+            return MergedTelemetricOTT.objects.all().iterator()
         except Exception as e:
             raise ValueError(f"Error al filtrar los datos: {str(e)}")
 
-    def dataRangeOTT(self, days):
+    def compute_all(self, dataOTT):
         """
-        Calcula la duración total de telemetría en horas para un rango de días específico.
+        Procesa todos los registros de telemetría OTT para calcular:
+        - Duración total en horas
+        - Duración por evento
+        - Conteo por evento
+        - Duración por franja horaria (madrugada, mañana, tarde, noche)
+        - Duración y conteo por franja horaria para cada tipo de evento
         """
-        try:
-            # Usar self.get_filtered_data en lugar de get_filtered_data
-            dataOTT = self.get_filtered_data(days)
-            durationOTT = sum(item.dataDuration if item.dataDuration is not None else 0 for item in dataOTT) / 3600
-            OTT = round(durationOTT, 2)
-    
-            today = datetime.now().date()
-            start_date = today - timedelta(days=days) if days > 0 else None
-    
-            return {
-                "duration": OTT,
-                "start_date": start_date.isoformat() if start_date else None,
-                "end_date": today.isoformat()
-            }
-        except Exception as e:
-            logger.error(f"Error en dataRangeOTT: {e}")
-            return None
+        duration = 0
+        data_by_franja = defaultdict(float)
+        data_by_event = defaultdict(float)
+        count_by_event = defaultdict(int)
+        franja_ranges = {
+            "Madrugada": (0, 5),
+            "Mañana": (5, 12),
+            "Tarde": (12, 18),
+            "Noche": (18, 24)
+        }
+        franja_events = {k: defaultdict(float) for k in franja_ranges}
+        franja_counts = {k: defaultdict(int) for k in franja_ranges}
 
-    def franjaHorarioOTT(self, days: int) -> Dict[str, Any]:
+        for item in dataOTT:
+            horas = item.dataDuration / 3600 if item.dataDuration else 0
+            duration += horas
+            count_by_event[item.dataName] += 1
+            data_by_event[item.dataName] += horas
+            if item.timeDate is not None:
+                for franja, (ini, fin) in franja_ranges.items():
+                    if ini <= item.timeDate < fin:
+                        data_by_franja[franja] += horas
+                        franja_events[franja][item.dataName] += horas
+                        franja_counts[franja][item.dataName] += 1
+                        break
+
+        return {
+            "total_duration": round(duration, 2),
+            "data_by_franja": {k: round(v, 2) for k, v in data_by_franja.items()},
+            "data_by_event": {k: round(v, 2) for k, v in data_by_event.items()},
+            "count_by_event": dict(count_by_event),
+            "franja_events": {k: {kk: round(vv, 2) for kk, vv in v.items()} for k, v in franja_events.items()},
+            "franja_counts": {k: dict(v) for k, v in franja_counts.items()}
+        }
+
+    def generate_graph(self, labels, values, title, y2_values=None, show_values=False):
         """
-        Calcula la duración de telemetría por franjas horarias y genera una gráfica de torta.
+        Genera un gráfico de barras (y opcionalmente líneas) usando Plotly.
+        Representa duración en horas y cantidad de vistas para los canales OTT.
 
-        Args:
-            days (int): Número de días hacia atrás para calcular el rango de fechas.
-
-        Returns:
-            dict: Diccionario con los datos por franja horaria y el gráfico en formato base64.
+        - labels: lista de nombres de canal/evento
+        - values: horas vistas
+        - y2_values: cantidad de vistas
+        - show_values: muestra texto sobre las barras
         """
-        if days <= 0:
-            raise ValueError("El número de días debe ser mayor a 0.")
-
-        try:
-            # Obtener los datos de telemetría filtrados
-            dataOTT = self.get_filtered_data(days)
-
-            # Validar que dataOTT no esté vacío
-            if not dataOTT:
-                return {"error": "No se encontraron datos en el rango especificado."}
-
-            # Definir franjas horarias
-            data_duration_by_franja = defaultdict(float)
-            franjas = {
-                "Madrugada": (0, 5),
-                "Mañana": (5, 12),
-                "Tarde": (12, 18),
-                "Noche": (18, 24)
-            }
-
-            # Calcular duración por franja horaria
-            for item in dataOTT:
-                hora = item.timeDate
-                for franja, (inicio, fin) in franjas.items():
-                    if inicio <= hora < fin:
-                        data_duration_by_franja[franja] += item.dataDuration / 3600 if item.dataDuration else 0
-
-            # Redondear los valores
-            data_duration_by_franja = {franja: round(duration, 2) for franja, duration in data_duration_by_franja.items()}
-
-            # Generar la gráfica de torta
-            labels = list(data_duration_by_franja.keys())
-            sizes = list(data_duration_by_franja.values())
-            colors = ['#ff9999', '#66b3ff', '#99ff99', '#ffcc99']  # Colores para las secciones de la torta
-
-            # Función personalizada para mostrar porcentaje y valor
-            def autopct_func(pct, all_vals):
-                absolute = int(round(pct / 100. * sum(all_vals), 2))
-                return f"{pct:.1f}%\n({absolute} h)"
-
-            plt.figure(figsize=(6, 6))
-            plt.pie(sizes, labels=labels, 
-                    autopct=lambda pct: autopct_func(pct, sizes), 
-                    startangle=140, 
-                    colors=colors)
-            plt.title('Distribución de Duración por Franja Horaria')
-
-            # Guardar la gráfica en un buffer
-            buf = io.BytesIO()
-            plt.savefig(buf, format='png')
-            buf.seek(0)
-            encoded_image = base64.b64encode(buf.getvalue()).decode('utf-8')
-            buf.close()
-            plt.close()
-
-            # Retornar los datos y la gráfica
-            return {
-                "data": data_duration_by_franja,
-                "chart": encoded_image  # Imagen codificada en base64
-            }
-
-        except ValueError as ve:
-            print(f"Error de validación: {ve}")
-            return {"error": str(ve)}
-        except Exception as e:
-            print(f"Ocurrió un error durante la generación de la gráfica: {e}")
-            return {"error": "Error interno del servidor."}
-
-    def listEventOTT(self, days):
-         """
-         Calcula la duración total por cada evento (dataName) en horas para un rango de días específico.
-         """
-         try:
-             dataOTT = self.get_filtered_data(days)
-
-             # Diccionario para almacenar la suma de dataDuration para cada dataName
-             data_duration_by_name = defaultdict(float)
-
-             for item in dataOTT:
-                 # Suma dataDuration para cada dataName
-                 data_duration_by_name[item.dataName] += item.dataDuration / 3600 if item.dataDuration else 0
-
-             rounded_data = {data_name: round(duration, 2) for data_name, duration in data_duration_by_name.items()}
-
-             return rounded_data
-
-         except ValidationError as e:
-             print(f"Error de validación durante la consulta a la base de datos: {e}")
-             return None
-         except Exception as e:
-             print(f"Ocurrió un error durante la consulta a la base de datos: {e}")
-             return None
-
-    def listCountEventOTT(self, days):
-        """
-        Cuenta la cantidad de eventos por tipo (dataName) en un rango de días específico.
-        """
-        try:
-            dataOTT = self.get_filtered_data(days)
-
-            ott = {}
-            for item in dataOTT:
-                event = item.dataName
-                ott[event] = ott.get(event, 0) + 1
-
-            return ott
-
-        except Exception as e:
-            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
-
-    def graphOTT(self, days):
-        """
-        Genera una gráfica interactiva con Plotly para comparar horas vistas y número de veces vistas por canal.
-        Organiza los datos en orden descendente según las horas vistas.
-        Args:
-        days (int): Número de días para filtrar los datos.
-        Returns:
-        dict: JSON de la gráfica interactiva.
-        """
-        if days < 0:
-            raise ValueError("El número de días debe ser mayor a 0.")
-        try:
-            # Obtener los datos
-            hours_data = self.listEventOTT(days)
-            count_data = self.listCountEventOTT(days)
-    
-            # Crear una lista de canales ordenada por horas vistas (descendente)
-            sorted_channels = sorted(hours_data.keys(), key=lambda x: hours_data[x], reverse=True)
-    
-            # Reorganizar los datos según el orden de sorted_channels
-            hours = [hours_data[channel] for channel in sorted_channels]
-            counts = [count_data.get(channel, 0) for channel in sorted_channels]
-    
-            # Crear figura
-            fig = go.Figure()
-    
-            # Agregar barras para las horas vistas
-            fig.add_trace(go.Bar(
-                x=sorted_channels,
-                y=hours,
-                name='Horas Vistas',
-                marker_color='pink',
-                opacity=0.7,
-                hovertemplate='<b>Canal:</b> %{x}<br><b>Horas:</b> %{y:.2f}<extra></extra>'
-            ))
-    
-            # Agregar línea para las veces vistas
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=labels, y=values, name='Horas Vistas',
+            marker_color='pink', opacity=0.7,
+            text=[f"{v:.2f}" for v in values] if show_values else None,
+            textposition='outside' if show_values else None
+        ))
+        if y2_values:
             fig.add_trace(go.Scatter(
-                x=sorted_channels,
-                y=counts,
-                mode='lines+markers',
-                name='Veces Vistas',
-                marker=dict(color='blue', size=8),
-                line=dict(width=2),
-                hovertemplate='<b>Canal:</b> %{x}<br><b>Veces Vistas:</b> %{y}<extra></extra>'
+                x=labels, y=y2_values,
+                mode='lines+markers+text', name='Veces Vistas',
+                marker=dict(color='blue', size=8), line=dict(width=2),
+                text=[f"{v}" for v in y2_values], textposition="top center"
             ))
-    
-            # Configurar diseño
-            fig.update_layout(
-                title='Comparativa de Horas vs Veces Vistas por Canal',
-                xaxis_title='Canales',
-                yaxis=dict(
-                    title=dict(
-                        text='Horas Vistas',
-                        font=dict(color='pink')  # ✅ Corrección: titlefont → title.font
-                    ),
-                    type='log',  
-                    showgrid=True
-                ),
-                yaxis2=dict(
-                    title=dict(
-                        text='Veces Vistas',
-                        font=dict(color='blue')  # ✅ Corrección: titlefont → title.font
-                    ),
-                    overlaying='y',
-                    side='right',
-                    type='log'  
-                ),
-                xaxis=dict(
-                    tickangle=45,
-                    tickmode='array',
-                    tickvals=list(range(len(sorted_channels))),
-                    ticktext=sorted_channels
-                ),
-                template='plotly_white',
-                legend=dict(
-                    orientation="h",
-                    yanchor="bottom",
-                    y=1.02,
-                    xanchor="right",
-                    x=1
-                ),
-                height=600,  # Aumentar la altura del gráfico
-                margin=dict(b=100)  # Aumentar el margen inferior para las etiquetas
-            )
-    
-            # Convertir la figura a JSON
-            graph_json = fig.to_json()
-            return {"graph": graph_json}
-        except Exception as e:
-            return {"error": str(e)}
+        fig.update_layout(
+            title=title, xaxis_title='Canales',
+            yaxis=dict(type='log', title=dict(text='Horas Vistas', font=dict(color='pink'))),
+            yaxis2=dict(type='log', title=dict(text='Veces Vistas', font=dict(color='blue')),
+                        overlaying='y', side='right'),
+            template='plotly_white',
+            xaxis=dict(tickangle=45),
+            height=600, margin=dict(b=150)
+        )
+        return fig.to_json()
 
-    def franjaHorarioEventOTTMadrugada(self, days):
+    def get(self, request, days=7):
         """
-        Calcula la duración de telemetría para eventos en la franja horaria de madrugada (00:00 a 05:00).
+        Endpoint GET que agrupa las estadísticas de telemetría OTT para los últimos `days` días.
+        Retorna:
+        - Total de duración
+        - Duración por franja horaria y por evento
+        - Cantidad de eventos por tipo y franja horaria
+        - Gráficos por franja horaria y general
         """
         try:
-            dataOTT = self.get_filtered_data(days)
-
-            # Diccionario para almacenar la duración por tipo de evento
-            data_duration_by_event = defaultdict(float)
-
-            # Filtrar eventos en la madrugada y sumar la duración
-            for item in dataOTT:
-                if 0 <= item.timeDate < 5:  # Franja horaria de la madrugada
-                    data_duration_by_event[item.dataName] += item.dataDuration / 3600 if item.dataDuration else 0
-
-            # Redondear los resultados
-            result = {data_name: round(duration, 2) for data_name, duration in data_duration_by_event.items()}
-            return result
-
-        except ValidationError as e:
-            print(f"Error de validación durante la consulta a la base de datos: {e}")
-            return None
-        except Exception as e:
-            print(f"Ocurrió un error durante la consulta a la base de datos: {e}")
-            return None
-
-    def listCountEventOTTMadrugada(self, days):
-        """
-        Cuenta la cantidad de eventos por tipo (dataName) en la franja horaria de madrugada (00:00 a 05:00).
-        """
-        try:
-            dataOTT = self.get_filtered_data(days)
-
-            # Diccionario para almacenar el conteo de eventos
-            ott_madrugada = defaultdict(int)
-
-            # Filtrar eventos en la madrugada y contar
-            for item in dataOTT:
-                if 0 <= item.timeDate < 5:
-                    ott_madrugada[item.dataName] += 1
-
-            return dict(ott_madrugada)
-
-        except Exception as e:
-            print(f"Error: {e}")
-            return None
-
-    def graphOTTMadrugada(self, days):
-        """
-        Genera una gráfica de barras y líneas para comparar horas vistas y número de veces vistas por canal (madrugada).
-        """
-        if days < 0:
-            raise ValueError("El número de días debe ser mayor a 0.")
-        try:
-            # Obtener los datos
-            hours_data = self.franjaHorarioEventOTTMadrugada(days)
-            count_data = self.listCountEventOTTMadrugada(days)
-
-            # Crear una lista de canales ordenada por horas vistas (descendente)
-            sorted_channels = sorted(hours_data.keys(), key=lambda x: hours_data[x], reverse=True)
-
-            # Reorganizar los datos según el orden de sorted_channels
-            hours = [hours_data[channel] for channel in sorted_channels]
-            counts = [count_data.get(channel, 0) for channel in sorted_channels]
-
-            # Crear figura
-            fig = go.Figure()
-
-            # Agregar barras para las horas vistas
-            fig.add_trace(go.Bar(
-                x=sorted_channels,
-                y=hours,
-                name='Horas Vistas',
-                marker_color='pink',
-                opacity=0.7,
-                hovertemplate='<b>Canal:</b> %{x}<br><b>Horas:</b> %{y:.2f}<extra></extra>'
-            ))
-
-            # Agregar línea para las veces vistas
-            fig.add_trace(go.Scatter(
-                x=sorted_channels,
-                y=counts,
-                mode='lines+markers',
-                name='Veces Vistas',
-                marker=dict(color='blue', size=8),
-                line=dict(width=2),
-                hovertemplate='<b>Canal:</b> %{x}<br><b>Veces Vistas:</b> %{y}<extra></extra>'
-            ))
-
-            # Configurar diseño
-            fig.update_layout(
-                xaxis_title='Canales',
-                yaxis=dict(
-                    title=dict(
-                        text='Horas Vistas',
-                        font=dict(color='pink')  # ✅ Corrección: titlefont → title.font
-                    ),
-                    type='log',  
-                    showgrid=True
-                ),
-                yaxis2=dict(
-                    title=dict(
-                        text='Veces Vistas',
-                        font=dict(color='blue')  # ✅ Corrección: titlefont → title.font
-                    ),
-                    overlaying='y',
-                    side='right',
-                    type='log'  
-                ),
-                xaxis=dict(
-                    tickangle=45,
-                    tickmode='array',
-                    tickvals=list(range(len(sorted_channels))),
-                    ticktext=sorted_channels
-                ),
-                template='plotly_white',
-                legend=dict(
-                    orientation="h",
-                    yanchor="bottom",
-                    y=1.02,
-                    xanchor="right",
-                    x=1
-                ),
-                height=600,  # Aumentar la altura del gráfico
-                margin=dict(b=100)  # Aumentar el margen inferior para las etiquetas
-            )
-    
-            # Convertir la figura a JSON
-            graph_json = fig.to_json()
-            return {"graph": graph_json}
-        except Exception as e:
-            return {"error": str(e)}
-
-    def listCountEventOTTMañana(self, days):
-        """
-        Cuenta la cantidad de eventos por tipo (dataName) en la franja horaria de la mañana (05:00 a 12:00).
-        """
-        try:
-            # Obtener los datos filtrados por el rango de días
-            dataOTT = self.get_filtered_data(days)
-
-            # Diccionario para almacenar el conteo de eventos en la mañana
-            ott_mañana = defaultdict(int)
-
-            # Filtrar y contar eventos en la franja de la mañana
-            for item in dataOTT:
-                if 5 <= item.timeDate < 12:  # Verificar si la hora está en la franja de la mañana
-                    ott_mañana[item.dataName] += 1  # Incrementar el contador
-
-            return dict(ott_mañana)  # Convertir a diccionario estándar antes de devolver
-
-        except Exception as e:
-            # Manejar errores
-            return {"error": str(e)}
-
-    def franjaHorarioEventOTTMañana(self, days):
-        """
-        Calcula la duración total de telemetría para eventos en la franja de la mañana (05:00 a 12:00).
-        """
-        try:
-            dataOTT = self.get_filtered_data(days)
-
-            # Diccionario para almacenar la duración por tipo de evento
-            data_duration_by_event = defaultdict(float)
-
-            # Filtrar eventos en la mañana y sumar la duración
-            for item in dataOTT:
-                if 5 <= item.timeDate < 12:  # Franja de la mañana
-                    data_duration_by_event[item.dataName] += item.dataDuration / 3600 if item.dataDuration else 0
-
-            # Redondear los resultados
-            result = {data_name: round(duration, 2) for data_name, duration in data_duration_by_event.items()}
-            return result
-
-        except ValidationError as e:
-            print(f"Error de validación durante la consulta a la base de datos: {e}")
-            return None
-        except Exception as e:
-            print(f"Ocurrió un error durante la consulta a la base de datos: {e}")
-            return None
-
-    def graphOTTMañana(self, days):
-        """
-        Genera un gráfico combinado (barras y líneas) para la franja de la mañana (05:00 a 12:00).
-        """
-        if days < 0:
-            raise ValueError("El número de días debe ser mayor a 0.")
-        try:
-            # Obtener los datos
-            hours_data = self.franjaHorarioEventOTTMañana(days)  # {dataName: horas}
-            count_data = self.listCountEventOTTMañana(days)  # {dataName: conteo}
-
-            # Crear una lista de canales ordenada por horas vistas (descendente)
-            sorted_channels = sorted(hours_data.keys(), key=lambda x: hours_data[x], reverse=True)
-    
-            # Reorganizar los datos según el orden de sorted_channels
-            hours = [hours_data[channel] for channel in sorted_channels]
-            counts = [count_data.get(channel, 0) for channel in sorted_channels]
-    
-            # Crear figura
-            fig = go.Figure()
-    
-            # Agregar barras para las horas vistas
-            fig.add_trace(go.Bar(
-                x=sorted_channels,
-                y=hours,
-                name='Horas Vistas',
-                marker_color='pink',
-                opacity=0.7,
-                hovertemplate='<b>Canal:</b> %{x}<br><b>Horas:</b> %{y:.2f}<extra></extra>'
-            ))
-    
-            # Agregar línea para las veces vistas
-            fig.add_trace(go.Scatter(
-                x=sorted_channels,
-                y=counts,
-                mode='lines+markers',
-                name='Veces Vistas',
-                marker=dict(color='blue', size=8),
-                line=dict(width=2),
-                hovertemplate='<b>Canal:</b> %{x}<br><b>Veces Vistas:</b> %{y}<extra></extra>'
-            ))
-    
-            # Configurar diseño
-            fig.update_layout(
-                xaxis_title='Canales',
-                yaxis=dict(
-                    title=dict(
-                        text='Horas Vistas',
-                        font=dict(color='pink')  # ✅ Corrección: titlefont → title.font
-                    ),
-                    type='log',  
-                    showgrid=True
-                ),
-                yaxis2=dict(
-                    title=dict(
-                        text='Veces Vistas',
-                        font=dict(color='blue')  # ✅ Corrección: titlefont → title.font
-                    ),
-                    overlaying='y',
-                    side='right',
-                    type='log'  
-                ),
-                xaxis=dict(
-                    tickangle=45,
-                    tickmode='array',
-                    tickvals=list(range(len(sorted_channels))),
-                    ticktext=sorted_channels
-                ),
-                template='plotly_white',
-                legend=dict(
-                    orientation="h",
-                    yanchor="bottom",
-                    y=1.02,
-                    xanchor="right",
-                    x=1
-                ),
-                height=600,  # Aumentar la altura del gráfico
-                margin=dict(b=100)  # Aumentar el margen inferior para las etiquetas
-            )
-    
-            # Convertir la figura a JSON
-            graph_json = fig.to_json()
-            return {"graph": graph_json}
-        except Exception as e:
-            return {"error": str(e)}
-
-    def franjaHorarioEventOTTTarde(self, days):
-        """
-        Calcula la duración total de telemetría para eventos en la franja de la tarde (12:00 a 18:00).
-        """
-        try:
-            dataOTT = self.get_filtered_data(days)
-
-            # Diccionario para almacenar la duración por tipo de evento
-            data_duration_by_event = defaultdict(float)
-
-            # Filtrar eventos en la tarde y sumar la duración
-            for item in dataOTT:
-                if 12 <= item.timeDate < 18:  # Franja de la tarde
-                    data_duration_by_event[item.dataName] += item.dataDuration / 3600 if item.dataDuration else 0
-
-            # Redondear los resultados
-            result = {data_name: round(duration, 2) for data_name, duration in data_duration_by_event.items()}
-            return result
-
-        except ValidationError as e:
-            print(f"Error de validación durante la consulta a la base de datos: {e}")
-            return None
-        except Exception as e:
-            print(f"Ocurrió un error durante la consulta a la base de datos: {e}")
-            return None
-
-    def listCountEventOTTTarde(self, days):
-        """
-        Cuenta la cantidad de eventos por tipo (dataName) en la franja horaria de la tarde (12:00 a 18:00).
-        """
-        try:
-            # Obtener los datos filtrados por el rango de días
-            dataOTT = self.get_filtered_data(days)
-
-            # Diccionario para almacenar el conteo de eventos en la tarde
-            ott_tarde = defaultdict(int)
-
-            # Filtrar eventos en la tarde y contar
-            for item in dataOTT:
-                if 12 <= item.timeDate < 18:  # Verificar si la hora está en la franja de la tarde
-                    ott_tarde[item.dataName] += 1
-
-            return dict(ott_tarde)  # Convertir a diccionario estándar antes de devolver
-
-        except Exception as e:
-            print(f"Error: {e}")
-            return None
-
-    def graphOTTTarde(self, days):
-        """
-        Genera un gráfico combinado (barras y líneas) para la franja de la tarde (12:00 a 18:00).
-        """
-        if days < 0:
-            raise ValueError("El número de días debe ser mayor a 0.")
-        try:
-            # Obtener los datos
-            hours_data = self.franjaHorarioEventOTTTarde(days)  # {dataName: horas}
-            count_data = self.listCountEventOTTTarde(days)  # {dataName: conteo}
-
-            # Crear una lista de canales ordenada por horas vistas (descendente)
-            sorted_channels = sorted(hours_data.keys(), key=lambda x: hours_data[x], reverse=True)
-    
-            # Reorganizar los datos según el orden de sorted_channels
-            hours = [hours_data[channel] for channel in sorted_channels]
-            counts = [count_data.get(channel, 0) for channel in sorted_channels]
-    
-            # Crear figura
-            fig = go.Figure()
-    
-            # Agregar barras para las horas vistas
-            fig.add_trace(go.Bar(
-                x=sorted_channels,
-                y=hours,
-                name='Horas Vistas',
-                marker_color='pink',
-                opacity=0.7,
-                hovertemplate='<b>Canal:</b> %{x}<br><b>Horas:</b> %{y:.2f}<extra></extra>'
-            ))
-    
-            # Agregar línea para las veces vistas
-            fig.add_trace(go.Scatter(
-                x=sorted_channels,
-                y=counts,
-                mode='lines+markers',
-                name='Veces Vistas',
-                marker=dict(color='blue', size=8),
-                line=dict(width=2),
-                hovertemplate='<b>Canal:</b> %{x}<br><b>Veces Vistas:</b> %{y}<extra></extra>'
-            ))
-    
-            # Configurar diseño
-            fig.update_layout(
-                xaxis_title='Canales',
-                yaxis=dict(
-                    title=dict(
-                        text='Horas Vistas',
-                        font=dict(color='pink')  # ✅ Corrección: titlefont → title.font
-                    ),
-                    type='log',  
-                    showgrid=True
-                ),
-                yaxis2=dict(
-                    title=dict(
-                        text='Veces Vistas',
-                        font=dict(color='blue')  # ✅ Corrección: titlefont → title.font
-                    ),
-                    overlaying='y',
-                    side='right',
-                    type='log'  
-                ),
-                xaxis=dict(
-                    tickangle=45,
-                    tickmode='array',
-                    tickvals=list(range(len(sorted_channels))),
-                    ticktext=sorted_channels
-                ),
-                template='plotly_white',
-                legend=dict(
-                    orientation="h",
-                    yanchor="bottom",
-                    y=1.02,
-                    xanchor="right",
-                    x=1
-                ),
-                height=600,  # Aumentar la altura del gráfico
-                margin=dict(b=100)  # Aumentar el margen inferior para las etiquetas
-            )
-    
-            # Convertir la figura a JSON
-            graph_json = fig.to_json()
-            return {"graph": graph_json}
-        except Exception as e:
-            return {"error": str(e)}
-
-    def franjaHorarioEventOTTNoche(self, days):
-        """
-        Calcula la duración total de telemetría para eventos en la franja de la noche (18:00 a 24:00).
-        """
-        try:
-            dataOTT = self.get_filtered_data(days)
-
-            # Diccionario para almacenar la duración por tipo de evento
-            data_duration_by_event = defaultdict(float)
-
-            # Filtrar eventos en la noche y sumar la duración
-            for item in dataOTT:
-                if 18 <= item.timeDate < 24:  # Franja de la noche
-                    data_duration_by_event[item.dataName] += item.dataDuration / 3600 if item.dataDuration else 0
-
-            # Redondear los resultados
-            result = {data_name: round(duration, 2) for data_name, duration in data_duration_by_event.items()}
-            return result
-
-        except ValidationError as e:
-            print(f"Error de validación durante la consulta a la base de datos: {e}")
-            return None
-        except Exception as e:
-            print(f"Ocurrió un error durante la consulta a la base de datos: {e}")
-            return None
-
-    def listCountEventOTTNoche(self, days):
-        """
-        Cuenta la cantidad de eventos por tipo (dataName) en la franja horaria de la noche (18:00 a 24:00).
-        """
-        try:
-            # Obtener los datos filtrados por el rango de días
-            dataOTT = self.get_filtered_data(days)
-
-            # Diccionario para almacenar el conteo de eventos en la noche
-            ott_noche = defaultdict(int)
-
-            # Filtrar eventos en la noche y contar
-            for item in dataOTT:
-                if 18 <= item.timeDate < 24:  # Verificar si la hora está en la franja de la noche
-                    ott_noche[item.dataName] += 1
-
-            return dict(ott_noche)  # Convertir a diccionario estándar antes de devolver
-
-        except Exception as e:
-            print(f"Error: {e}")
-            return None
-
-    def graphOTTNoche(self, days):
-        """
-        Genera un gráfico combinado (barras y líneas) para la franja de la noche (18:00 a 24:00),
-        ordenando los canales de mayor a menor según las horas vistas y mostrando las horas vistas sobre las barras.
-        """
-        if days < 0:
-            raise ValueError("El número de días debe ser mayor a 0.")
-        try:
-            # Obtener los datos
-            hours_data = self.franjaHorarioEventOTTNoche(days)  # {dataName: horas}
-            count_data = self.listCountEventOTTNoche(days)  # {dataName: conteo}
-
-            # Crear una lista de canales ordenada por horas vistas (descendente)
-            sorted_data = sorted(hours_data.items(), key=lambda x: x[1], reverse=True)
-            sorted_channels = [item[0] for item in sorted_data]  # Extraer nombres de canales
-            sorted_hours = [item[1] for item in sorted_data]  # Extraer horas vistas
-            sorted_counts = [count_data.get(channel, 0) for channel in sorted_channels]  # Ordenar conteos
-
-            # Crear figura
-            fig = go.Figure()
-
-            # Agregar barras para las horas vistas
-            fig.add_trace(go.Bar(
-                x=sorted_channels,
-                y=sorted_hours,
-                name='Horas Vistas',
-                marker_color='pink',
-                opacity=0.7,
-                text=[f"{hours:.2f}" for hours in sorted_hours],  # Mostrar las horas vistas sobre las barras
-                textposition='outside',
-                hovertemplate='<b>Canal:</b> %{x}<br><b>Horas:</b> %{y:.2f}<extra></extra>'
-            ))
-
-            # Agregar línea para las veces vistas
-            fig.add_trace(go.Scatter(
-                x=sorted_channels,
-                y=sorted_counts,
-                mode='lines+markers+text',
-                name='Veces Vistas',
-                text=[f"{count}" for count in sorted_counts],
-                textposition="top center",
-                marker=dict(color='blue', size=8),
-                line=dict(width=2),
-                hovertemplate='<b>Canal:</b> %{x}<br><b>Veces Vistas:</b> %{y}<extra></extra>'
-            ))
-
-            # Configurar diseño
-            fig.update_layout(
-                xaxis_title='Canales',
-                yaxis=dict(
-                    title=dict(
-                        text='Horas Vistas',
-                        font=dict(color='pink')  # ✅ Corrección: titlefont → title.font
-                    ),
-                    type='log',  
-                    showgrid=True
-                ),
-                yaxis2=dict(
-                    title=dict(
-                        text='Veces Vistas',
-                        font=dict(color='blue')  # ✅ Corrección: titlefont → title.font
-                    ),
-                    overlaying='y',
-                    side='right',
-                    type='log'  
-                ),
-                template='plotly_white',
-                legend=dict(
-                    orientation="h",
-                    yanchor="bottom",
-                    y=1.02,
-                    xanchor="right",
-                    x=1
-                ),
-                height=600,
-                margin=dict(b=150),
-                xaxis=dict(
-                    tickangle=45,  # Rotar etiquetas
-                    tickmode='array',
-                    tickvals=list(range(len(sorted_channels))),
-                    ticktext=sorted_channels
-                )
-            )
-
-            # Mostrar valores en la escala logarítmica solo si hay datos pequeños
-            if min(sorted_hours) > 0:
-                fig.update_layout(
-                    yaxis=dict(
-                        type="log",  # Escala logarítmica
-                        showgrid=True,
-                        titlefont=dict(color="pink")
-                    )
-                )
-
-            return {"graph": fig.to_json()}
-        except Exception as e:
-            print(f"Error: {e}")
-            return {"error": str(e)}
-
-    def get(self, request, days=None):
-        try:
-            # Obtener los datos
-            durationOTT = self.dataRangeOTT(days)
-            franjaHorarioOOT = self.franjaHorarioOTT(days)
-
-            ottEvents = self.listEventOTT(days)
-            listCountEventOTT = self.listCountEventOTT(days)
-            graphOTT = self.graphOTT(days)
-
-            graphOTTMadrugada = self.graphOTTMadrugada(days)
-            franjahorariaEventsOTTMadrugada = self.franjaHorarioEventOTTMadrugada(days)
-            countChannelsMadrugada = self.listCountEventOTTMadrugada(days)
-
-            graphOTTMañana = self.graphOTTMañana(days)
-            franjahorariaEventsOTTMañana = self.franjaHorarioEventOTTMañana(days)
-            countChannelsMañana = self.listCountEventOTTMañana(days)
-
-            graphOTTTarde = self.graphOTTTarde(days)
-            franjahorariaEventsOTTTarde = self.franjaHorarioEventOTTTarde(days)
-            countChannelsTarde = self.listCountEventOTTTarde(days)
-
-            graphOTTNoche = self.graphOTTNoche(days)
-            franjahorariaEventsOTTNoche = self.franjaHorarioEventOTTNoche(days)
-            countChannelsNoche = self.listCountEventOTTNoche(days)
-            return Response(
-                {
-                    "totals": {
-                        "franjahorariaeventottmadrugada": franjahorariaEventsOTTMadrugada,
-                        "countchannelsmadrugada": countChannelsMadrugada,
-                        "franjahorariaeventottmañana": franjahorariaEventsOTTMañana,
-                        "countchannelsmañana": countChannelsMañana,
-                        "franjahorariaeventotttarde": franjahorariaEventsOTTTarde,
-                        "countchannelstarde": countChannelsTarde,
-                        "franjahorariaeventottnoche": franjahorariaEventsOTTNoche,
-                        "countchannelsnoche": countChannelsNoche,
-                        "totaldurationott": durationOTT,
-                        "franjahorariaott": franjaHorarioOOT,
-                    },
-                    "events": {
-                        "listOTT": ottEvents,
-                        "listCountEventOTT": listCountEventOTT,
-                    },
-                    "graphs": {
-                        "graphott": graphOTT,
-                        "graphottMadrugada": graphOTTMadrugada,
-                        "graphottMañana": graphOTTMañana,
-                        "graphottTarde": graphOTTTarde,
-                        "graphottNoche": graphOTTNoche,
-                    },
+            dataOTT = list(self.get_filtered_data(int(days)))
+            metrics = self.compute_all(dataOTT)
+
+            sorted_channels = sorted(metrics['data_by_event'], key=metrics['data_by_event'].get, reverse=True)
+            hours = [metrics['data_by_event'][ch] for ch in sorted_channels]
+            counts = [metrics['count_by_event'].get(ch, 0) for ch in sorted_channels]
+
+            graph_ott = self.generate_graph(sorted_channels, hours, "Total OTT", y2_values=counts, show_values=True)
+            franja_graphs = {}
+            for franja in ["Madrugada", "Mañana", "Tarde", "Noche"]:
+                chs = sorted(metrics['franja_events'][franja], key=metrics['franja_events'][franja].get, reverse=True)
+                hrs = [metrics['franja_events'][franja][ch] for ch in chs]
+                cnts = [metrics['franja_counts'][franja].get(ch, 0) for ch in chs]
+                franja_graphs[franja] = self.generate_graph(chs, hrs, f"OTT {franja}", y2_values=cnts, show_values=True)
+
+            return Response({
+                "totals": {
+                    "total_duration_ott": metrics['total_duration'],
+                    "franja_horaria_ott": metrics['data_by_franja'],
+                    "event_duration": metrics['data_by_event'],
+                    "event_count": metrics['count_by_event'],
+                    "franja_event_duration": metrics['franja_events'],
+                    "franja_event_count": metrics['franja_counts']
                 },
-                status=status.HTTP_200_OK
-            )
-        except ValueError as ve:
-            return Response({"error": str(ve)}, status=status.HTTP_400_BAD_REQUEST)
-        except KeyError as ke:
-            return Response({"error": f"Clave no encontrada: {ke}"}, status=status.HTTP_400_BAD_REQUEST)
+                "graphs": {
+                    "graph_ott": graph_ott,
+                    "graph_franjas": franja_graphs
+                }
+            }, status=status.HTTP_200_OK)
+
         except Exception as e:
-            return Response({"error": f"Error interno: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 class TelemetriaDateOTT(APIView):
-    @staticmethod
-    def get_filtered_data(start_date, end_date):
+    def get_filtered_data(self, start_date, end_date):
         """
-        Filtra los datos del modelo MergedTelemetricOTT según el rango de dias proporcionado.
+        Devuelve un iterador de registros de MergedTelemetricOTT filtrado por fechas.
+        Utiliza `.iterator()` para evitar cargar todo en memoria y reducir uso de RAM.
         """
         try:
-            # Asegurarse de que las fechas estén en el orden correcto
             start_date, end_date = sorted([start_date, end_date])
-            
-            # Filtrar los datos por rango de fechas
-            return MergedTelemetricOTT.objects.filter(dataDate__range=[start_date, end_date])
+            return MergedTelemetricOTT.objects.filter(dataDate__range=[start_date, end_date]).iterator()
         except ValueError as e:
             raise ValueError(f"Error al filtrar los datos: {str(e)}")
 
-    def dataDateRangeOTT(self, start_date, end_date):
+    def compute_metrics(self, dataOTT):
         """
-        Calcula la duración total de telemetría para un rango de fechas específico.
+        Procesa todos los registros filtrados para calcular:
+        - Duración total
+        - Duración por evento
+        - Conteo por evento
+        - Duración por franja horaria
+        - Duración y conteo por franja para cada evento
         """
-        try:
-            # Filtrar los datos por rango de fechas
-            dataOTT = self.get_filtered_data(start_date, end_date)
-            durationOTT = sum(item.dataDuration if item.dataDuration is not None else 0 for item in dataOTT) / 3600
-            OTT = round(durationOTT, 2)
-            return {
-                "duration": OTT,
-                "start_date": start_date,
-                "end_date": end_date
-            }
-        except Exception as e:
-            logger.error(f"Error en dataRangeOTT: {e}")
-            return None
+        duration = 0
+        data_by_franja = defaultdict(float)
+        data_by_event = defaultdict(float)
+        count_by_event = defaultdict(int)
+        franja_ranges = {
+            "Madrugada": (0, 5),
+            "Mañana": (5, 12),
+            "Tarde": (12, 18),
+            "Noche": (18, 24)
+        }
+        franja_events = {k: defaultdict(float) for k in franja_ranges}
+        franja_counts = {k: defaultdict(int) for k in franja_ranges}
 
-    def dateFranjaHorarioOTT(self, start_date, end_date) -> Dict[str, Any]:
+        for item in dataOTT:
+            horas = item.dataDuration / 3600 if item.dataDuration else 0
+            duration += horas
+            count_by_event[item.dataName] += 1
+            data_by_event[item.dataName] += horas
+            if item.timeDate is not None:
+                for franja, (ini, fin) in franja_ranges.items():
+                    if ini <= item.timeDate < fin:
+                        data_by_franja[franja] += horas
+                        franja_events[franja][item.dataName] += horas
+                        franja_counts[franja][item.dataName] += 1
+                        break
+
+        return {
+            "total_duration": round(duration, 2),
+            "data_by_franja": {k: round(v, 2) for k, v in data_by_franja.items()},
+            "data_by_event": {k: round(v, 2) for k, v in data_by_event.items()},
+            "count_by_event": dict(count_by_event),
+            "franja_events": {k: {kk: round(vv, 2) for kk, vv in v.items()} for k, v in franja_events.items()},
+            "franja_counts": {k: dict(v) for k, v in franja_counts.items()}
+        }
+
+    def generate_chart(self, labels, values, title, y2_values=None, show_values=False):
         """
-        Calcula la duración de telemetría por franjas horarias y genera una gráfica de torta.
-
-        Args:
-            days (int): Número de días hacia atrás para calcular el rango de fechas.
-
-        Returns:
-            dict: Diccionario con los datos por franja horaria y el gráfico en formato base64.
+        Genera un gráfico de barras (y opcionalmente líneas) con Plotly para representar:
+        - Duración total de eventos (valores en eje izquierdo)
+        - Conteo de eventos (valores en eje derecho)
         """
-
-        try:
-            # Obtener los datos de telemetría filtrados
-            dataOTT = self.get_filtered_data(start_date, end_date)
-
-            # Validar que dataOTT no esté vacío
-            if not dataOTT:
-                return {"error": "No se encontraron datos en el rango especificado."}
-
-            # Definir franjas horarias
-            data_duration_by_franja = defaultdict(float)
-            franjas = {
-                "Madrugada": (0, 5),
-                "Mañana": (5, 12),
-                "Tarde": (12, 18),
-                "Noche": (18, 24)
-            }
-
-            # Calcular duración por franja horaria
-            for item in dataOTT:
-                hora = item.timeDate
-                for franja, (inicio, fin) in franjas.items():
-                    if inicio <= hora < fin:
-                        data_duration_by_franja[franja] += item.dataDuration / 3600 if item.dataDuration else 0
-
-            # Redondear los valores
-            data_duration_by_franja = {franja: round(duration, 2) for franja, duration in data_duration_by_franja.items()}
-
-            # Generar la gráfica de torta
-            labels = list(data_duration_by_franja.keys())
-            sizes = list(data_duration_by_franja.values())
-            colors = ['#ff9999', '#66b3ff', '#99ff99', '#ffcc99']  # Colores para las secciones de la torta
-
-            # Función personalizada para mostrar porcentaje y valor
-            def autopct_func(pct, all_vals):
-                absolute = int(round(pct / 100. * sum(all_vals), 2))
-                return f"{pct:.1f}%\n({absolute} h)"
-
-            plt.figure(figsize=(6, 6))
-            plt.pie(sizes, labels=labels, 
-                    autopct=lambda pct: autopct_func(pct, sizes), 
-                    startangle=140, 
-                    colors=colors)
-            plt.title('Distribución de Duración por Franja Horaria')
-
-            # Guardar la gráfica en un buffer
-            buf = io.BytesIO()
-            plt.savefig(buf, format='png')
-            buf.seek(0)
-            encoded_image = base64.b64encode(buf.getvalue()).decode('utf-8')
-            buf.close()
-            plt.close()
-
-            # Retornar los datos y la gráfica
-            return {
-                "data": data_duration_by_franja,
-                "chart": encoded_image  # Imagen codificada en base64
-            }
-
-        except ValueError as ve:
-            print(f"Error de validación: {ve}")
-            return {"error": str(ve)}
-        except Exception as e:
-            print(f"Ocurrió un error durante la generación de la gráfica: {e}")
-            return {"error": "Error interno del servidor."}
-
-    def listEventOTT(self, start_date, end_date):
-         """
-         Calcula la duración total por cada evento (dataName) en horas para un rango de días específico.
-         """
-         try:
-             dataOTT = self.get_filtered_data(start_date, end_date)
-
-             # Diccionario para almacenar la suma de dataDuration para cada dataName
-             data_duration_by_name = defaultdict(float)
-
-             for item in dataOTT:
-                 # Suma dataDuration para cada dataName
-                 data_duration_by_name[item.dataName] += item.dataDuration / 3600 if item.dataDuration else 0
-
-             rounded_data = {data_name: round(duration, 2) for data_name, duration in data_duration_by_name.items()}
-
-             return rounded_data
-
-         except ValidationError as e:
-             print(f"Error de validación durante la consulta a la base de datos: {e}")
-             return None
-         except Exception as e:
-             print(f"Ocurrió un error durante la consulta a la base de datos: {e}")
-             return None
-
-    def listCountEventOTT(self, start_date, end_date):
-        """
-        Cuenta la cantidad de eventos por tipo (dataName) en un rango de días específico.
-        """
-        try:
-            dataOTT = self.get_filtered_data(start_date, end_date)
-
-            ott = {}
-            for item in dataOTT:
-                event = item.dataName
-                ott[event] = ott.get(event, 0) + 1
-
-            return ott
-
-        except Exception as e:
-            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
-
-    def graphOTT(self, start_date, end_date):
-        """
-        Genera una gráfica interactiva con Plotly para comparar horas vistas y número de veces vistas por canal.
-        Organiza los datos en orden descendente según las horas vistas.
-        Args:
-        days (int): Número de días para filtrar los datos.
-        Returns:
-        dict: JSON de la gráfica interactiva.
-        """
-        try:
-            # Obtener los datos
-            hours_data = self.listEventOTT(start_date, end_date)
-            count_data = self.listCountEventOTT(start_date, end_date)
-    
-            # Crear una lista de canales ordenada por horas vistas (descendente)
-            sorted_channels = sorted(hours_data.keys(), key=lambda x: hours_data[x], reverse=True)
-    
-            # Reorganizar los datos según el orden de sorted_channels
-            hours = [hours_data[channel] for channel in sorted_channels]
-            counts = [count_data.get(channel, 0) for channel in sorted_channels]
-    
-            # Crear figura
-            fig = go.Figure()
-    
-            # Agregar barras para las horas vistas
-            fig.add_trace(go.Bar(
-                x=sorted_channels,
-                y=hours,
-                name='Horas Vistas',
-                marker_color='pink',
-                opacity=0.7,
-                hovertemplate='<b>Canal:</b> %{x}<br><b>Horas:</b> %{y:.2f}<extra></extra>'
-            ))
-    
-            # Agregar línea para las veces vistas
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=labels, y=values, name='Horas Vistas',
+            marker_color='pink', opacity=0.7,
+            text=[f"{v:.2f}" for v in values] if show_values else None,
+            textposition='outside' if show_values else None
+        ))
+        if y2_values:
             fig.add_trace(go.Scatter(
-                x=sorted_channels,
-                y=counts,
-                mode='lines+markers',
-                name='Veces Vistas',
-                marker=dict(color='blue', size=8),
-                line=dict(width=2),
-                hovertemplate='<b>Canal:</b> %{x}<br><b>Veces Vistas:</b> %{y}<extra></extra>'
+                x=labels, y=y2_values,
+                mode='lines+markers+text', name='Veces Vistas',
+                marker=dict(color='blue', size=8), line=dict(width=2),
+                text=[f"{v}" for v in y2_values], textposition="top center"
             ))
-    
-            # Configurar diseño
-            fig.update_layout(
-                title='Comparativa de Horas vs Veces Vistas por Canal',
-                xaxis_title='Canales',
-                yaxis=dict(
-                    title=dict(
-                        text='Horas Vistas',
-                        font=dict(color='pink')  # ✅ Corrección: titlefont → title.font
-                    ),
-                    type='log',  
-                    showgrid=True
-                ),
-                yaxis2=dict(
-                    title=dict(
-                        text='Veces Vistas',
-                        font=dict(color='blue')  # ✅ Corrección: titlefont → title.font
-                    ),
-                    overlaying='y',
-                    side='right',
-                    type='log'  
-                ),
-                xaxis=dict(
-                    tickangle=45,
-                    tickmode='array',
-                    tickvals=list(range(len(sorted_channels))),
-                    ticktext=sorted_channels
-                ),
-                template='plotly_white',
-                legend=dict(
-                    orientation="h",
-                    yanchor="bottom",
-                    y=1.02,
-                    xanchor="right",
-                    x=1
-                ),
-                height=600,  # Aumentar la altura del gráfico
-                margin=dict(b=100)  # Aumentar el margen inferior para las etiquetas
-            )
-    
-            # Convertir la figura a JSON
-            graph_json = fig.to_json()
-            return {"graph": graph_json}
-        except Exception as e:
-            return {"error": str(e)}
-
-    def franjaHorarioEventOTTMadrugada(self, start_date, end_date):
-        """
-        Calcula la duración de telemetría para eventos en la franja horaria de madrugada (00:00 a 05:00).
-        """
-        try:
-            dataOTT = self.get_filtered_data(start_date, end_date)
-
-            # Diccionario para almacenar la duración por tipo de evento
-            data_duration_by_event = defaultdict(float)
-
-            # Filtrar eventos en la madrugada y sumar la duración
-            for item in dataOTT:
-                if 0 <= item.timeDate < 5:  # Franja horaria de la madrugada
-                    data_duration_by_event[item.dataName] += item.dataDuration / 3600 if item.dataDuration else 0
-
-            # Redondear los resultados
-            result = {data_name: round(duration, 2) for data_name, duration in data_duration_by_event.items()}
-            return result
-
-        except ValidationError as e:
-            print(f"Error de validación durante la consulta a la base de datos: {e}")
-            return None
-        except Exception as e:
-            print(f"Ocurrió un error durante la consulta a la base de datos: {e}")
-            return None
-
-    def listCountEventOTTMadrugada(self, start_date, end_date):
-        """
-        Cuenta la cantidad de eventos por tipo (dataName) en la franja horaria de madrugada (00:00 a 05:00).
-        """
-        try:
-            dataOTT = self.get_filtered_data(start_date, end_date)
-
-            # Diccionario para almacenar el conteo de eventos
-            ott_madrugada = defaultdict(int)
-
-            # Filtrar eventos en la madrugada y contar
-            for item in dataOTT:
-                if 0 <= item.timeDate < 5:
-                    ott_madrugada[item.dataName] += 1
-
-            return dict(ott_madrugada)
-
-        except Exception as e:
-            print(f"Error: {e}")
-            return None
-
-    def graphOTTMadrugada(self, start_date, end_date):
-        """
-        Genera una gráfica de barras y líneas para comparar horas vistas y número de veces vistas por canal (madrugada).
-        """
-
-        try:
-            # Obtener los datos
-            hours_data = self.franjaHorarioEventOTTMadrugada(start_date, end_date)
-            count_data = self.listCountEventOTTMadrugada(start_date, end_date)
-
-            # Crear una lista de canales ordenada por horas vistas (descendente)
-            sorted_channels = sorted(hours_data.keys(), key=lambda x: hours_data[x], reverse=True)
-
-            # Reorganizar los datos según el orden de sorted_channels
-            hours = [hours_data[channel] for channel in sorted_channels]
-            counts = [count_data.get(channel, 0) for channel in sorted_channels]
-
-            # Crear figura
-            fig = go.Figure()
-
-            # Agregar barras para las horas vistas
-            fig.add_trace(go.Bar(
-                x=sorted_channels,
-                y=hours,
-                name='Horas Vistas',
-                marker_color='pink',
-                opacity=0.7,
-                hovertemplate='<b>Canal:</b> %{x}<br><b>Horas:</b> %{y:.2f}<extra></extra>'
-            ))
-
-            # Agregar línea para las veces vistas
-            fig.add_trace(go.Scatter(
-                x=sorted_channels,
-                y=counts,
-                mode='lines+markers',
-                name='Veces Vistas',
-                marker=dict(color='blue', size=8),
-                line=dict(width=2),
-                hovertemplate='<b>Canal:</b> %{x}<br><b>Veces Vistas:</b> %{y}<extra></extra>'
-            ))
-
-            # Configurar diseño
-            fig.update_layout(
-                xaxis_title='Canales',
-                yaxis=dict(
-                    title=dict(
-                        text='Horas Vistas',
-                        font=dict(color='pink')  # ✅ Corrección: titlefont → title.font
-                    ),
-                    type='log',  
-                    showgrid=True
-                ),
-                yaxis2=dict(
-                    title=dict(
-                        text='Veces Vistas',
-                        font=dict(color='blue')  # ✅ Corrección: titlefont → title.font
-                    ),
-                    overlaying='y',
-                    side='right',
-                    type='log'  
-                ),
-                xaxis=dict(
-                    tickangle=45,
-                    tickmode='array',
-                    tickvals=list(range(len(sorted_channels))),
-                    ticktext=sorted_channels
-                ),
-                template='plotly_white',
-                legend=dict(
-                    orientation="h",
-                    yanchor="bottom",
-                    y=1.02,
-                    xanchor="right",
-                    x=1
-                ),
-                height=600,  # Aumentar la altura del gráfico
-                margin=dict(b=100)  # Aumentar el margen inferior para las etiquetas
-            )
-    
-            # Convertir la figura a JSON
-            graph_json = fig.to_json()
-            return {"graph": graph_json}
-        except Exception as e:
-            return {"error": str(e)}
-
-    def listCountEventOTTMañana(self, start_date, end_date):
-        """
-        Cuenta la cantidad de eventos por tipo (dataName) en la franja horaria de la mañana (05:00 a 12:00).
-        """
-        try:
-            # Obtener los datos filtrados por el rango de días
-            dataOTT = self.get_filtered_data(start_date, end_date)
-
-            # Diccionario para almacenar el conteo de eventos en la mañana
-            ott_mañana = defaultdict(int)
-
-            # Filtrar y contar eventos en la franja de la mañana
-            for item in dataOTT:
-                if 5 <= item.timeDate < 12:  # Verificar si la hora está en la franja de la mañana
-                    ott_mañana[item.dataName] += 1  # Incrementar el contador
-
-            return dict(ott_mañana)  # Convertir a diccionario estándar antes de devolver
-
-        except Exception as e:
-            # Manejar errores
-            return {"error": str(e)}
-
-    def franjaHorarioEventOTTMañana(self, start_date, end_date):
-        """
-        Calcula la duración total de telemetría para eventos en la franja de la mañana (05:00 a 12:00).
-        """
-        try:
-            dataOTT = self.get_filtered_data(start_date, end_date)
-
-            # Diccionario para almacenar la duración por tipo de evento
-            data_duration_by_event = defaultdict(float)
-
-            # Filtrar eventos en la mañana y sumar la duración
-            for item in dataOTT:
-                if 5 <= item.timeDate < 12:  # Franja de la mañana
-                    data_duration_by_event[item.dataName] += item.dataDuration / 3600 if item.dataDuration else 0
-
-            # Redondear los resultados
-            result = {data_name: round(duration, 2) for data_name, duration in data_duration_by_event.items()}
-            return result
-
-        except ValidationError as e:
-            print(f"Error de validación durante la consulta a la base de datos: {e}")
-            return None
-        except Exception as e:
-            print(f"Ocurrió un error durante la consulta a la base de datos: {e}")
-            return None
-
-    def graphOTTMañana(self, start_date, end_date):
-        """
-        Genera un gráfico combinado (barras y líneas) para la franja de la mañana (05:00 a 12:00).
-        """
-
-        try:
-            # Obtener los datos
-            hours_data = self.franjaHorarioEventOTTMañana(start_date, end_date)  # {dataName: horas}
-            count_data = self.listCountEventOTTMañana(start_date, end_date)  # {dataName: conteo}
-
-            # Crear una lista de canales ordenada por horas vistas (descendente)
-            sorted_channels = sorted(hours_data.keys(), key=lambda x: hours_data[x], reverse=True)
-    
-            # Reorganizar los datos según el orden de sorted_channels
-            hours = [hours_data[channel] for channel in sorted_channels]
-            counts = [count_data.get(channel, 0) for channel in sorted_channels]
-    
-            # Crear figura
-            fig = go.Figure()
-    
-            # Agregar barras para las horas vistas
-            fig.add_trace(go.Bar(
-                x=sorted_channels,
-                y=hours,
-                name='Horas Vistas',
-                marker_color='pink',
-                opacity=0.7,
-                hovertemplate='<b>Canal:</b> %{x}<br><b>Horas:</b> %{y:.2f}<extra></extra>'
-            ))
-    
-            # Agregar línea para las veces vistas
-            fig.add_trace(go.Scatter(
-                x=sorted_channels,
-                y=counts,
-                mode='lines+markers',
-                name='Veces Vistas',
-                marker=dict(color='blue', size=8),
-                line=dict(width=2),
-                hovertemplate='<b>Canal:</b> %{x}<br><b>Veces Vistas:</b> %{y}<extra></extra>'
-            ))
-    
-            # Configurar diseño
-            fig.update_layout(
-                xaxis_title='Canales',
-                yaxis=dict(
-                    title=dict(
-                        text='Horas Vistas',
-                        font=dict(color='pink')  # ✅ Corrección: titlefont → title.font
-                    ),
-                    type='log',  
-                    showgrid=True
-                ),
-                yaxis2=dict(
-                    title=dict(
-                        text='Veces Vistas',
-                        font=dict(color='blue')  # ✅ Corrección: titlefont → title.font
-                    ),
-                    overlaying='y',
-                    side='right',
-                    type='log'  
-                ),
-                xaxis=dict(
-                    tickangle=45,
-                    tickmode='array',
-                    tickvals=list(range(len(sorted_channels))),
-                    ticktext=sorted_channels
-                ),
-                template='plotly_white',
-                legend=dict(
-                    orientation="h",
-                    yanchor="bottom",
-                    y=1.02,
-                    xanchor="right",
-                    x=1
-                ),
-                height=600,  # Aumentar la altura del gráfico
-                margin=dict(b=100)  # Aumentar el margen inferior para las etiquetas
-            )
-    
-            # Convertir la figura a JSON
-            graph_json = fig.to_json()
-            return {"graph": graph_json}
-        except Exception as e:
-            return {"error": str(e)}
-
-    def franjaHorarioEventOTTTarde(self, start_date, end_date):
-        """
-        Calcula la duración total de telemetría para eventos en la franja de la tarde (12:00 a 18:00).
-        """
-        try:
-            dataOTT = self.get_filtered_data(start_date, end_date)
-
-            # Diccionario para almacenar la duración por tipo de evento
-            data_duration_by_event = defaultdict(float)
-
-            # Filtrar eventos en la tarde y sumar la duración
-            for item in dataOTT:
-                if 12 <= item.timeDate < 18:  # Franja de la tarde
-                    data_duration_by_event[item.dataName] += item.dataDuration / 3600 if item.dataDuration else 0
-
-            # Redondear los resultados
-            result = {data_name: round(duration, 2) for data_name, duration in data_duration_by_event.items()}
-            return result
-
-        except ValidationError as e:
-            print(f"Error de validación durante la consulta a la base de datos: {e}")
-            return None
-        except Exception as e:
-            print(f"Ocurrió un error durante la consulta a la base de datos: {e}")
-            return None
-
-    def listCountEventOTTTarde(self, start_date, end_date):
-        """
-        Cuenta la cantidad de eventos por tipo (dataName) en la franja horaria de la tarde (12:00 a 18:00).
-        """
-        try:
-            # Obtener los datos filtrados por el rango de días
-            dataOTT = self.get_filtered_data(start_date, end_date)
-
-            # Diccionario para almacenar el conteo de eventos en la tarde
-            ott_tarde = defaultdict(int)
-
-            # Filtrar eventos en la tarde y contar
-            for item in dataOTT:
-                if 12 <= item.timeDate < 18:  # Verificar si la hora está en la franja de la tarde
-                    ott_tarde[item.dataName] += 1
-
-            return dict(ott_tarde)  # Convertir a diccionario estándar antes de devolver
-
-        except Exception as e:
-            print(f"Error: {e}")
-            return None
-
-    def graphOTTTarde(self, start_date, end_date):
-        """
-        Genera un gráfico combinado (barras y líneas) para la franja de la tarde (12:00 a 18:00).
-        """
-        
-        try:
-            # Obtener los datos
-            hours_data = self.franjaHorarioEventOTTTarde(start_date, end_date)  # {dataName: horas}
-            count_data = self.listCountEventOTTTarde(start_date, end_date)  # {dataName: conteo}
-
-            # Crear una lista de canales ordenada por horas vistas (descendente)
-            sorted_channels = sorted(hours_data.keys(), key=lambda x: hours_data[x], reverse=True)
-    
-            # Reorganizar los datos según el orden de sorted_channels
-            hours = [hours_data[channel] for channel in sorted_channels]
-            counts = [count_data.get(channel, 0) for channel in sorted_channels]
-    
-            # Crear figura
-            fig = go.Figure()
-    
-            # Agregar barras para las horas vistas
-            fig.add_trace(go.Bar(
-                x=sorted_channels,
-                y=hours,
-                name='Horas Vistas',
-                marker_color='pink',
-                opacity=0.7,
-                hovertemplate='<b>Canal:</b> %{x}<br><b>Horas:</b> %{y:.2f}<extra></extra>'
-            ))
-    
-            # Agregar línea para las veces vistas
-            fig.add_trace(go.Scatter(
-                x=sorted_channels,
-                y=counts,
-                mode='lines+markers',
-                name='Veces Vistas',
-                marker=dict(color='blue', size=8),
-                line=dict(width=2),
-                hovertemplate='<b>Canal:</b> %{x}<br><b>Veces Vistas:</b> %{y}<extra></extra>'
-            ))
-    
-            # Configurar diseño
-            fig.update_layout(
-                xaxis_title='Canales',
-                yaxis=dict(
-                    title=dict(
-                        text='Horas Vistas',
-                        font=dict(color='pink')  # ✅ Corrección: titlefont → title.font
-                    ),
-                    type='log',  
-                    showgrid=True
-                ),
-                yaxis2=dict(
-                    title=dict(
-                        text='Veces Vistas',
-                        font=dict(color='blue')  # ✅ Corrección: titlefont → title.font
-                    ),
-                    overlaying='y',
-                    side='right',
-                    type='log'  
-                ),
-                xaxis=dict(
-                    tickangle=45,
-                    tickmode='array',
-                    tickvals=list(range(len(sorted_channels))),
-                    ticktext=sorted_channels
-                ),
-                template='plotly_white',
-                legend=dict(
-                    orientation="h",
-                    yanchor="bottom",
-                    y=1.02,
-                    xanchor="right",
-                    x=1
-                ),
-                height=600,  # Aumentar la altura del gráfico
-                margin=dict(b=100)  # Aumentar el margen inferior para las etiquetas
-            )
-    
-            # Convertir la figura a JSON
-            graph_json = fig.to_json()
-            return {"graph": graph_json}
-        except Exception as e:
-            return {"error": str(e)}
-
-    def franjaHorarioEventOTTNoche(self, start_date, end_date):
-        """
-        Calcula la duración total de telemetría para eventos en la franja de la noche (18:00 a 24:00).
-        """
-        try:
-            dataOTT = self.get_filtered_data(start_date, end_date)
-
-            # Diccionario para almacenar la duración por tipo de evento
-            data_duration_by_event = defaultdict(float)
-
-            # Filtrar eventos en la noche y sumar la duración
-            for item in dataOTT:
-                if 18 <= item.timeDate < 24:  # Franja de la noche
-                    data_duration_by_event[item.dataName] += item.dataDuration / 3600 if item.dataDuration else 0
-
-            # Redondear los resultados
-            result = {data_name: round(duration, 2) for data_name, duration in data_duration_by_event.items()}
-            return result
-
-        except ValidationError as e:
-            print(f"Error de validación durante la consulta a la base de datos: {e}")
-            return None
-        except Exception as e:
-            print(f"Ocurrió un error durante la consulta a la base de datos: {e}")
-            return None
-
-    def listCountEventOTTNoche(self, start_date, end_date):
-        """
-        Cuenta la cantidad de eventos por tipo (dataName) en la franja horaria de la noche (18:00 a 24:00).
-        """
-        try:
-            # Obtener los datos filtrados por el rango de días
-            dataOTT = self.get_filtered_data(start_date, end_date)
-
-            # Diccionario para almacenar el conteo de eventos en la noche
-            ott_noche = defaultdict(int)
-
-            # Filtrar eventos en la noche y contar
-            for item in dataOTT:
-                if 18 <= item.timeDate < 24:  # Verificar si la hora está en la franja de la noche
-                    ott_noche[item.dataName] += 1
-
-            return dict(ott_noche)  # Convertir a diccionario estándar antes de devolver
-
-        except Exception as e:
-            print(f"Error: {e}")
-            return None
-
-    def graphOTTNoche(self, start_date, end_date):
-        """
-        Genera un gráfico combinado (barras y líneas) para la franja de la noche (18:00 a 24:00),
-        ordenando los canales de mayor a menor según las horas vistas y mostrando las horas vistas sobre las barras.
-        """
-        try:
-            # Obtener los datos
-            hours_data = self.franjaHorarioEventOTTNoche(start_date, end_date)  # {dataName: horas}
-            count_data = self.listCountEventOTTNoche(start_date, end_date)  # {dataName: conteo}
-
-            # Crear una lista de canales ordenada por horas vistas (descendente)
-            sorted_data = sorted(hours_data.items(), key=lambda x: x[1], reverse=True)
-            sorted_channels = [item[0] for item in sorted_data]  # Extraer nombres de canales
-            sorted_hours = [item[1] for item in sorted_data]  # Extraer horas vistas
-            sorted_counts = [count_data.get(channel, 0) for channel in sorted_channels]  # Ordenar conteos
-
-            # Crear figura
-            fig = go.Figure()
-
-            # Agregar barras para las horas vistas
-            fig.add_trace(go.Bar(
-                x=sorted_channels,
-                y=sorted_hours,
-                name='Horas Vistas',
-                marker_color='pink',
-                opacity=0.7,
-                text=[f"{hours:.2f}" for hours in sorted_hours],  # Mostrar las horas vistas sobre las barras
-                textposition='outside',
-                hovertemplate='<b>Canal:</b> %{x}<br><b>Horas:</b> %{y:.2f}<extra></extra>'
-            ))
-
-            # Agregar línea para las veces vistas
-            fig.add_trace(go.Scatter(
-                x=sorted_channels,
-                y=sorted_counts,
-                mode='lines+markers+text',
-                name='Veces Vistas',
-                text=[f"{count}" for count in sorted_counts],
-                textposition="top center",
-                marker=dict(color='blue', size=8),
-                line=dict(width=2),
-                hovertemplate='<b>Canal:</b> %{x}<br><b>Veces Vistas:</b> %{y}<extra></extra>'
-            ))
-
-            # Configurar diseño
-            fig.update_layout(
-                xaxis_title='Canales',
-                yaxis=dict(
-                    title=dict(
-                        text='Horas Vistas',
-                        font=dict(color='pink')  # ✅ Corrección: titlefont → title.font
-                    ),
-                    type='log',  
-                    showgrid=True
-                ),
-                yaxis2=dict(
-                    title=dict(
-                        text='Veces Vistas',
-                        font=dict(color='blue')  # ✅ Corrección: titlefont → title.font
-                    ),
-                    overlaying='y',
-                    side='right',
-                    type='log'  
-                ),
-                template='plotly_white',
-                legend=dict(
-                    orientation="h",
-                    yanchor="bottom",
-                    y=1.02,
-                    xanchor="right",
-                    x=1
-                ),
-                height=600,
-                margin=dict(b=150),
-                xaxis=dict(
-                    tickangle=45,  # Rotar etiquetas
-                    tickmode='array',
-                    tickvals=list(range(len(sorted_channels))),
-                    ticktext=sorted_channels
-                )
-            )
-
-            # Mostrar valores en la escala logarítmica solo si hay datos pequeños
-            if min(sorted_hours) > 0:
-                fig.update_layout(
-                    yaxis=dict(
-                        type="log",  # Escala logarítmica
-                        showgrid=True,
-                        titlefont=dict(color="pink")
-                    )
-                )
-
-            return {"graph": fig.to_json()}
-        except Exception as e:
-            print(f"Error: {e}")
-            return {"error": str(e)}
-
+        fig.update_layout(
+            title=title, xaxis_title='Canales',
+            yaxis=dict(type='log', title=dict(text='Horas Vistas', font=dict(color='pink'))),
+            yaxis2=dict(type='log', title=dict(text='Veces Vistas', font=dict(color='blue')),
+                        overlaying='y', side='right'),
+            template='plotly_white',
+            xaxis=dict(tickangle=45),
+            height=600, margin=dict(b=150)
+        )
+        return fig.to_json()
 
     def get(self, request, start, end):
+        """
+        Endpoint GET que recibe dos fechas (start y end) y retorna:
+        - Duración total entre fechas
+        - Duración por franja horaria y evento
+        - Conteo por evento y por franja
+        - Gráficos totales y por franja
+        """
         try:
-            # Convertir las fechas de la URL a objetos datetime
-            start_date = datetime.strptime(start, "%Y-%m-%d")
-            end_date = datetime.strptime(end, "%Y-%m-%d")
+            start_date = datetime.strptime(start, "%Y-%m-%d").date()
+            end_date = datetime.strptime(end, "%Y-%m-%d").date()
+            dataOTT = list(self.get_filtered_data(start_date, end_date))
+            metrics = self.compute_metrics(dataOTT)
 
-            # Obtener los datos
-            durationOTT = self.dataDateRangeOTT(start_date, end_date)
-            franjaHorarioOOT = self.dateFranjaHorarioOTT(start_date, end_date)
+            sorted_channels = sorted(metrics['data_by_event'], key=metrics['data_by_event'].get, reverse=True)
+            hours = [metrics['data_by_event'][ch] for ch in sorted_channels]
+            counts = [metrics['count_by_event'].get(ch, 0) for ch in sorted_channels]
 
-            ottEvents = self.listEventOTT(start_date, end_date)
-            listCountEventOTT = self.listCountEventOTT(start_date, end_date)
-            graphOTT = self.graphOTT(start_date, end_date)
+            graph_ott = self.generate_chart(sorted_channels, hours, "Total OTT", y2_values=counts, show_values=True)
+            franja_graphs = {}
+            for franja in ["Madrugada", "Mañana", "Tarde", "Noche"]:
+                chs = sorted(metrics['franja_events'][franja], key=metrics['franja_events'][franja].get, reverse=True)
+                hrs = [metrics['franja_events'][franja][ch] for ch in chs]
+                cnts = [metrics['franja_counts'][franja].get(ch, 0) for ch in chs]
+                franja_graphs[franja] = self.generate_chart(chs, hrs, f"OTT {franja}", y2_values=cnts, show_values=True)
 
-            graphOTTMadrugada = self.graphOTTMadrugada(start_date, end_date)
-            franjahorariaEventsOTTMadrugada = self.franjaHorarioEventOTTMadrugada(start_date, end_date)
-            countChannelsMadrugada = self.listCountEventOTTMadrugada(start_date, end_date)
-
-            graphOTTMañana = self.graphOTTMañana(start_date, end_date)
-            franjahorariaEventsOTTMañana = self.franjaHorarioEventOTTMañana(start_date, end_date)
-            countChannelsMañana = self.listCountEventOTTMañana(start_date, end_date)
-
-            graphOTTTarde = self.graphOTTTarde(start_date, end_date)
-            franjahorariaEventsOTTTarde = self.franjaHorarioEventOTTTarde(start_date, end_date)
-            countChannelsTarde = self.listCountEventOTTTarde(start_date, end_date)
-
-            graphOTTNoche = self.graphOTTNoche(start_date, end_date)
-            franjahorariaEventsOTTNoche = self.franjaHorarioEventOTTNoche(start_date, end_date)
-            countChannelsNoche = self.listCountEventOTTNoche(start_date, end_date)
-
-
-            # Retornar los datos como respuesta
-            return Response(
-                {
-                    "totals": {
-                        "franjahorariaeventottmadrugada": franjahorariaEventsOTTMadrugada,
-                        "countchannelsmadrugada": countChannelsMadrugada,
-                        "franjahorariaeventottmañana": franjahorariaEventsOTTMañana,
-                        "countchannelsmañana": countChannelsMañana,
-                        "franjahorariaeventotttarde": franjahorariaEventsOTTTarde,
-                        "countchannelstarde": countChannelsTarde,
-                        "franjahorariaeventottnoche": franjahorariaEventsOTTNoche,
-                        "countchannelsnoche": countChannelsNoche,
-                        "totaldurationott": durationOTT,
-                        "franjahorariaott": franjaHorarioOOT,
-                    },
-                    "events": {
-                        "listOTT": ottEvents,
-                        "listCountEventOTT": listCountEventOTT,
-                    },
-                    "graphs": {
-                        "graphott": graphOTT,
-                        "graphottMadrugada": graphOTTMadrugada,
-                        "graphottMañana": graphOTTMañana,
-                        "graphottTarde": graphOTTTarde,
-                        "graphottNoche": graphOTTNoche,
-                    },
+            return Response({
+                "totals": {
+                    "total_duration_ott": metrics['total_duration'],
+                    "franja_horaria_ott": metrics['data_by_franja'],
+                    "event_duration": metrics['data_by_event'],
+                    "event_count": metrics['count_by_event'],
+                    "franja_event_duration": metrics['franja_events'],
+                    "franja_event_count": metrics['franja_counts']
                 },
-                status=status.HTTP_200_OK)
-        except ValueError as e:
-            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+                "graphs": {
+                    "graph_ott": graph_ott,
+                    "graph_franjas": franja_graphs
+                }
+            }, status=status.HTTP_200_OK)
         except Exception as e:
-            return Response({"error": "Error inesperado al procesar la solicitud"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 class TelemetriaDaysDvb(APIView):
-    def dataRangeDVB(self, days):
+    def get_filtered_data(self, days):
+        """
+        Devuelve un iterador sobre los registros del modelo MergedTelemetricDVB
+        filtrados por el rango de fechas correspondiente a los últimos `days` días.
+        Si `days` es 0 o negativo, devuelve todos los registros.
+        """
         try:
+            today = datetime.now().date()
             if days > 0:
-                today = datetime.now().date()
                 start_date = today - timedelta(days=days)
-                dataDVB = MergedTelemetricDVB.objects.filter(dataDate__range=[start_date, today])
-            else:
-                dataDVB = MergedTelemetricDVB.objects.all()
-            
+                return MergedTelemetricDVB.objects.filter(dataDate__range=[start_date, today]).iterator(), start_date, today
+            return MergedTelemetricDVB.objects.all().iterator(), None, today
+        except Exception as e:
+            raise ValueError(f"Error al filtrar los datos: {str(e)}")
+
+    def dataRangeDVB(self, days):
+        """
+        Calcula la duración total de los eventos DVB para los últimos `days` días.
+        """
+        try:
+            dataDVB, start_date, today = self.get_filtered_data(days)
             durationDVB = sum(item.dataDuration if item.dataDuration is not None else 0 for item in dataDVB) / 3600
-            DVB = round(durationDVB, 2)
-            return {"duration": DVB, "start_date": start_date, "end_date": today}
-        
+            return {"duration": round(durationDVB, 2), "start_date": start_date, "end_date": today}
         except Exception as e:
             return None
 
     def franjaHorarioDVB(self, days):
+        """
+        Calcula la duración total por franja horaria (Madrugada, Mañana, Tarde, Noche).
+        """
         try:
-            if days > 0:
-                today = datetime.now().date()
-                start_date = today - timedelta(days=days)
-                dataDVB = MergedTelemetricDVB.objects.filter(dataDate__range=[start_date, today])
-            else:
-                dataDVB = MergedTelemetricDVB.objects.all()
-
+            dataDVB, _, _ = self.get_filtered_data(days)
             data_duration_by_franja = defaultdict(int)
             franjas = {
                 "Madrugada": (0, 5),
@@ -2746,37 +1216,25 @@ class TelemetriaDaysDvb(APIView):
                     if limites[0] <= hora < limites[1]:
                         data_duration_by_franja[franja] += item.dataDuration / 3600 if item.dataDuration else 0
 
-            data_duration_by_franja = {franja: round(duration, 2) for franja, duration in data_duration_by_franja.items()}
-            
-            result = dict(data_duration_by_franja)
+            return {franja: round(duration, 2) for franja, duration in data_duration_by_franja.items()}
 
-            return result
-        except ValidationError as e:  # Captura específicamente las excepciones de validación
+        except ValidationError as e:
             print(f"Error de validación durante la serialización: {e}")
             return None
-        except Exception as e:  # Captura otras excepciones
+        except Exception as e:
             print(f"Ocurrió un error durante la serialización: {e}")
             return None
 
     def listEventDVB(self, days):
+        """
+        Calcula la duración total por tipo de evento DVB (dataName) en horas.
+        """
         try:
-            if days > 0:
-                today = datetime.now().date()
-                start_date = today - timedelta(days=days)
-                dataDVB = MergedTelemetricDVB.objects.filter(dataDate__range=[start_date, today])
-            else:
-                dataDVB = MergedTelemetricDVB.objects.all()
-
-            # Diccionario para almacenar la suma de dataDuration para cada dataName
+            dataDVB, _, _ = self.get_filtered_data(days)
             data_duration_by_name = defaultdict(float)
-
             for item in dataDVB:
-                # Suma dataDuration para cada dataName
-                data_duration_by_name[item.dataName] += item.dataDuration /3600 if item.dataDuration else 0
-            
-            rounded_data = {data_name: round(duration, 2) for data_name, duration in data_duration_by_name.items()}
-
-            return rounded_data
+                data_duration_by_name[item.dataName] += item.dataDuration / 3600 if item.dataDuration else 0
+            return {data_name: round(duration, 2) for data_name, duration in data_duration_by_name.items()}
 
         except ValidationError as e:
             print(f"Error de validación durante la consulta a la base de datos: {e}")
@@ -2786,14 +1244,11 @@ class TelemetriaDaysDvb(APIView):
             return None
 
     def franjaHorarioEventDVB(self, days):
+        """
+        Calcula la duración por tipo de evento DVB para cada franja horaria.
+        """
         try:
-            if days > 0:
-                today = datetime.now().date()
-                start_date = today - timedelta(days=days)
-                dataDVB = MergedTelemetricDVB.objects.filter(dataDate__range=[start_date, today])
-            else:
-                dataDVB = MergedTelemetricDVB.objects.all()
-
+            dataDVB, _, _ = self.get_filtered_data(days)
             data_duration_by_franja = defaultdict(lambda: defaultdict(float))
             franjas = {
                 "Madrugada": (0, 5),
@@ -2811,36 +1266,34 @@ class TelemetriaDaysDvb(APIView):
             result = {}
             for franja, data in data_duration_by_franja.items():
                 result[franja] = {data_name: round(duration, 2) for data_name, duration in data.items()}
-
             return result
 
-        except ValidationError as e:  # Captura específicamente las excepciones de validación
+        except ValidationError as e:
             print(f"Error de validación durante la consulta a la base de datos: {e}")
             return None
-        except Exception as e:  # Captura otras excepciones
+        except Exception as e:
             print(f"Ocurrió un error durante la consulta a la base de datos: {e}")
             return None
 
-
     def listCountEventDVB(self, days):
+        """
+        Cuenta la cantidad de eventos por tipo (dataName) para el rango de días dado.
+        """
         try:
-            if days > 0:
-                today = datetime.now().date()
-                start_date = today - timedelta(days=days)
-                dataOTT = MergedTelemetricDVB.objects.filter(dataDate__range=[start_date, today])
-            else:
-                dataOTT = MergedTelemetricDVB.objects.all()
-            
-            ott = {}
-            for item in dataOTT:
-                event = item.dataName
-                ott[event] = ott.get(event, 0) + 1
-            return ott
-        
+            dataDVB, _, _ = self.get_filtered_data(days)
+            counts = defaultdict(int)
+            for item in dataDVB:
+                counts[item.dataName] += 1
+            return dict(counts)
+
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
     def get(self, request, days=None):
+        """
+        Devuelve estadísticas generales sobre la duración y conteo de eventos DVB,
+        organizados por tipo y franja horaria.
+        """
         try:
             durationDVB = self.dataRangeDVB(days)
             franjaHorariaDVB = self.franjaHorarioDVB(days)
@@ -2851,9 +1304,9 @@ class TelemetriaDaysDvb(APIView):
                 {
                     "totaldurationdvb": durationDVB,
                     "franjahorariadvb": franjaHorariaDVB,
-                    "franjahorariaeventodvb":franjahorariaEventsDVB,
+                    "franjahorariaeventodvb": franjahorariaEventsDVB,
                     "listDVB": dvbEvents,
-                    "listCountEventDVB":listCountEventDVB,
+                    "listCountEventDVB": listCountEventDVB,
                 },
                 status=status.HTTP_200_OK)
         except Exception as e:
