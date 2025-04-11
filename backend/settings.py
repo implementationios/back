@@ -29,7 +29,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'corsheaders',
     'rest_framework',
-    'django_crontab', 
+    'django_cron', 
     'telemetria',
 ]
 

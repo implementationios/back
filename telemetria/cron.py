@@ -2,7 +2,7 @@ from django_cron import CronJobBase, Schedule
 from .tasks import test_fetch_store_telemetry, update_data_ott, update_data_dvb, update_data_end_catchup, update_data_stop_vod, update_data_end_vod
 
 class TestFetchStoreTelemetryCronJob(CronJobBase):
-    RUN_AT_TIMES = ['19:40', '12:00']  # Se ejecuta a las 00:00 y 12:00
+    RUN_AT_TIMES = ['00:00', '12:00']  # Se ejecuta a las 00:00 y 12:00
     schedule = Schedule(run_at_times=RUN_AT_TIMES)
     code = 'telemetria.test_fetch_store_telemetry'  # un código único
 
