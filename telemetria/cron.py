@@ -1,5 +1,5 @@
 from django_cron import CronJobBase, Schedule
-from .tasks import test_fetch_store_telemetry, update_data_ott, update_data_dvb, update_data_end_catchup, update_data_stop_vod, update_data_end_vod
+from .tasks import test_fetch_store_telemetry, update_data_ott, update_data_dvb, update_data_stop_catchup, update_data_end_catchup, update_data_stop_vod, update_data_end_vod
 
 class TestFetchStoreTelemetryCronJob(CronJobBase):
     RUN_EVERY_MINS = 10  # Se ejecuta cada 10min
@@ -24,6 +24,14 @@ class UpdateDataDvbCronJob(CronJobBase):
 
     def do(self):
         update_data_dvb()
+
+class UpdateDataStopCatchupCronJob(CronJobBase):
+    RUN_EVERY_MINS = 10  # Se ejecuta cada 10min
+    schedule = Schedule(run_every_mins=RUN_EVERY_MINS)
+    code = 'telemetria.update_data_stop_catchup'
+
+    def do(self):
+        update_data_stop_catchup()
 
 class UpdateDataEndCatchupCronJob(CronJobBase):
     RUN_EVERY_MINS = 10  # Se ejecuta cada 10min

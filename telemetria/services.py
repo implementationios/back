@@ -1,4 +1,6 @@
 from django.http import HttpRequest
+from rest_framework.test import APIRequestFactory
+from django.urls import reverse
 from .views import UpdateDataOTT, UpdateDataDVB, UpdateDataStopCatchup, UpdateDataEndCatchup, UpdateDataStopVOD, UpdateDataEndVOD
 import logging
 
@@ -18,67 +20,145 @@ def fetch_and_store_telemetry():
         raise
 
 def update_data_ott():
+    """
+    Función para iniciar la actualización de los datos de la tabla MergedTelemetricOTT.
+    Utiliza la vista UpdateDataOTT mediante una simulación de petición POST interna.
+    """
     try:
         logger.info("Iniciando actualización de datos OTT...")
-        UpdateDataOTT().data_ott()  # Llamamos al método estático de la vista
-        logger.info("Actualización de datos OTT completada con éxito.")
+        # Crea una fábrica para simular peticiones HTTP.
+        factory = APIRequestFactory()
+        # Genera la URL para la vista UpdateDataOTT utilizando el nombre definido en urls.py.
+        request = factory.post(reverse('updatedataott'))
+        # Instancia la vista UpdateDataOTT.
+        view = UpdateDataOTT().as_view()
+        # Llama a la vista con la petición simulada para ejecutar su lógica (método post).
+        response = view(request)
+        # Verifica si la respuesta de la vista indica éxito (códigos de estado 2xx).
+        if response.status_code >= 200 and response.status_code < 300:
+            logger.info(f"Actualización de datos OTT completada con éxito: {response.data}")
+        else:
+            logger.error(f"Error al actualizar datos OTT. Status code: {response.status_code}, Detalles: {response.data}")
     except Exception as e:
         logger.error(f"Error en la actualización de datos OTT: {e}")
         raise
 
 def update_data_dvb():
+    """
+    Función para iniciar la actualización de los datos de la tabla MergedTelemetricDVB.
+    Utiliza la vista UpdateDataDVB mediante una simulación de petición POST interna.
+    """
     try:
         logger.info("Iniciando actualización de datos DVB...")
-        UpdateDataDVB().dataDVB()  # Llamamos al método estático de la vista
-        logger.info("Actualización de datos DVB completada con éxito.")
+        # Crea una fábrica para simular peticiones HTTP.
+        factory = APIRequestFactory()
+        # Genera la URL para la vista UpdateDataDVB utilizando el nombre definido en urls.py.
+        request = factory.post(reverse('updatedatadvb'))
+        # Instancia la vista UpdateDataDVB.
+        view = UpdateDataDVB().as_view()
+        # Llama a la vista con la petición simulada para ejecutar su lógica (método post).
+        response = view(request)
+        # Verifica si la respuesta de la vista indica éxito (códigos de estado 2xx).
+        if response.status_code >= 200 and response.status_code < 300:
+            logger.info(f"Actualización de datos DVB completada con éxito: {response.data}")
+        else:
+            logger.error(f"Error al actualizar datos DVB. Status code: {response.status_code}, Detalles: {response.data}")
     except Exception as e:
         logger.error(f"Error en la actualización de datos DVB: {e}")
         raise
 
-def update_data_end_catchup():
-    """
-    Lógica para manejar el fin de catchup.
-    """
-    try:
-        logger.info("Iniciando manejo de fin de catchup...")
-        UpdateDataEndCatchup().dataEnd()
-        logger.info("Manejo de fin de catchup completado con éxito.")
-    except Exception as e:
-        logger.error(f"Error en el manejo de fin de catchup: {e}")
-        raise
-
 def update_data_stop_catchup():
     """
-    Lógica para manejar el fin de catchup.
+    Función para iniciar la actualización de los datos de la tabla MergedTelemetricStopCatchup.
+    Utiliza la vista UpdateDataStopCatchup mediante una simulación de petición POST interna.
     """
     try:
-        logger.info("Iniciando manejo de fin de catchup...")
-        UpdateDataStopCatchup().dataStop()
-        logger.info("Manejo de fin de catchup completado con éxito.")
+        logger.info("Iniciando actualización de datos Stop Catchup...")
+        # Crea una fábrica para simular peticiones HTTP.
+        factory = APIRequestFactory()
+        # Genera la URL para la vista UpdateDataStopCatchup utilizando el nombre definido en urls.py.
+        request = factory.post(reverse('updatedatastopcatchup'))
+        # Instancia la vista UpdateDataStopCatchup.
+        view = UpdateDataStopCatchup().as_view()
+        # Llama a la vista con la petición simulada para ejecutar su lógica (método post).
+        response = view(request)
+        # Verifica si la respuesta de la vista indica éxito (códigos de estado 2xx).
+        if response.status_code >= 200 and response.status_code < 300:
+            logger.info(f"Actualización de datos Stop Catchup completada con éxito: {response.data}")
+        else:
+            logger.error(f"Error al actualizar datos Stop Catchup. Status code: {response.status_code}, Detalles: {response.data}")
     except Exception as e:
-        logger.error(f"Error en el manejo de fin de catchup: {e}")
+        logger.error(f"Error en la actualización de datos Stop Catchup: {e}")
+        raise
+
+def update_data_end_catchup():
+    """
+    Función para iniciar la actualización de los datos de la tabla MergedTelemetricEndCatchup.
+    Utiliza la vista UpdateDataEndCatchup mediante una simulación de petición POST interna.
+    """
+    try:
+        logger.info("Iniciando actualización de datos End Catchup...")
+        # Crea una fábrica para simular peticiones HTTP.
+        factory = APIRequestFactory()
+        # Genera la URL para la vista UpdateDataEndCatchup utilizando el nombre definido en urls.py.
+        request = factory.post(reverse('updatedataendcatchup'))
+        # Instancia la vista UpdateDataEndCatchup.
+        view = UpdateDataEndCatchup().as_view()
+        # Llama a la vista con la petición simulada para ejecutar su lógica (método post).
+        response = view(request)
+        # Verifica si la respuesta de la vista indica éxito (códigos de estado 2xx).
+        if response.status_code >= 200 and response.status_code < 300:
+            logger.info(f"Actualización de datos End Catchup completada con éxito: {response.data}")
+        else:
+            logger.error(f"Error al actualizar datos End Catchup. Status code: {response.status_code}, Detalles: {response.data}")
+    except Exception as e:
+        logger.error(f"Error en la actualización de datos End Catchup: {e}")
         raise
 
 def update_data_stop_vod():
     """
-    Lógica para manejar la pausa de VOD.
+    Función para iniciar la actualización de los datos de la tabla MergedTelemetricStopVOD.
+    Utiliza la vista UpdateDataStopVOD mediante una simulación de petición POST interna.
     """
     try:
-        logger.info("Iniciando manejo de pausa de VOD...")
-        UpdateDataStopVOD().dataStop()
-        logger.info("Manejo de pausa de VOD completado con éxito.")
+        logger.info("Iniciando actualización de datos Stop VOD...")
+        # Crea una fábrica para simular peticiones HTTP.
+        factory = APIRequestFactory()
+        # Genera la URL para la vista UpdateDataStopVOD utilizando el nombre definido en urls.py.
+        request = factory.post(reverse('updatedatastopvod'))
+        # Instancia la vista UpdateDataStopVOD.
+        view = UpdateDataStopVOD().as_view()
+        # Llama a la vista con la petición simulada para ejecutar su lógica (método post).
+        response = view(request)
+        # Verifica si la respuesta de la vista indica éxito (códigos de estado 2xx).
+        if response.status_code >= 200 and response.status_code < 300:
+            logger.info(f"Actualización de datos Stop VOD completada con éxito: {response.data}")
+        else:
+            logger.error(f"Error al actualizar datos Stop VOD. Status code: {response.status_code}, Detalles: {response.data}")
     except Exception as e:
-        logger.error(f"Error en el manejo de pausa de VOD: {e}")
+        logger.error(f"Error en la actualización de datos Stop VOD: {e}")
         raise
 
 def update_data_end_vod():
     """
-    Lógica para manejar el fin de VOD.
+    Función para iniciar la actualización de los datos de la tabla MergedTelemetricEndVOD.
+    Utiliza la vista UpdateDataEndVOD mediante una simulación de petición POST interna.
     """
     try:
-        logger.info("Iniciando manejo de fin de VOD...")
-        UpdateDataEndVOD().dataEnd()
-        logger.info("Manejo de fin de VOD completado con éxito.")
+        logger.info("Iniciando actualización de datos End VOD...")
+        # Crea una fábrica para simular peticiones HTTP.
+        factory = APIRequestFactory()
+        # Genera la URL para la vista UpdateDataEndVOD utilizando el nombre definido en urls.py.
+        request = factory.post(reverse('updatedataendvod'))
+        # Instancia la vista UpdateDataEndVOD.
+        view = UpdateDataEndVOD().as_view()
+        # Llama a la vista con la petición simulada para ejecutar su lógica (método post).
+        response = view(request)
+        # Verifica si la respuesta de la vista indica éxito (códigos de estado 2xx).
+        if response.status_code >= 200 and response.status_code < 300:
+            logger.info(f"Actualización de datos End VOD completada con éxito: {response.data}")
+        else:
+            logger.error(f"Error al actualizar datos End VOD. Status code: {response.status_code}, Detalles: {response.data}")
     except Exception as e:
-        logger.error(f"Error en el manejo de fin de VOD: {e}")
+        logger.error(f"Error en la actualización de datos End VOD: {e}")
         raise

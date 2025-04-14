@@ -103,17 +103,17 @@ WSGI_APPLICATION = 'backend.wsgi.application'
 #     }
 # }
 
-DATABASES = {
-    'default': dj_database_url.config()
-}
+# DATABASES = {
+#     'default': dj_database_url.config()
+# }
 
 # DATABASES sqlite3
-# DATABASES = {
-#     "default": {
-#         "ENGINE": "django.db.backends.sqlite3",
-#         "NAME": "mydatabase",
-#     }
-# }
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.sqlite3",
+        "NAME": "mydatabase",
+    }
+}
 
 
 # Password validation
@@ -146,7 +146,7 @@ USE_I18N = True
 
 USE_L10N = True
 
-USE_TZ = True
+USE_TZ = False
 
 
 # Static files (CSS, JavaScript, Images)
@@ -223,6 +223,7 @@ CRON_CLASSES = [
     'telemetria.cron.TestFetchStoreTelemetryCronJob',
     'telemetria.cron.UpdateDataOttCronJob',
     'telemetria.cron.UpdateDataDvbCronJob',
+    'telemetria.cron.UpdateDataStopCatchupCronJob',
     'telemetria.cron.UpdateDataEndCatchupCronJob',
     'telemetria.cron.UpdateDataStopVodCronJob',
     'telemetria.cron.UpdateDataEndVodCronJob',

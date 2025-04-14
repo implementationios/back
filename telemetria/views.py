@@ -42,7 +42,7 @@ import time
 import hashlib
 import requests
 import plotly.graph_objects as go
-import io
+from io import BytesIO
 import base64
 
 import matplotlib
@@ -905,17 +905,22 @@ class TelemetriaDaysOTT(APIView):
     def get_filtered_data(self, days):
         """
         Devuelve un iterador sobre los registros del modelo MergedTelemetricOTT
-        filtrados por el rango de fechas correspondiente a los últimos `days` días.
-        Si `days` es 0 o negativo, devuelve todos los registros.
+        filtrados por el rango de fechas correspondiente a los últimos `days` días,
+        junto con la fecha de inicio y fin del filtro.
+        Si `days` es 0 o negativo, devuelve todos los registros y fechas None.
         """
         try:
             today = datetime.now().date()
+            start_date = None
             if days > 0:
                 start_date = today - timedelta(days=days)
-                return MergedTelemetricOTT.objects.filter(dataDate__range=[start_date, today]).iterator()
-            return MergedTelemetricOTT.objects.all().iterator()
+                queryset = MergedTelemetricOTT.objects.filter(dataDate__range=[start_date, today]).iterator()
+            else:
+                queryset = MergedTelemetricOTT.objects.all().iterator()
+            return queryset, start_date, today
         except Exception as e:
             raise ValueError(f"Error al filtrar los datos: {str(e)}")
+    
 
     def compute_all(self, dataOTT):
         """
@@ -995,6 +1000,31 @@ class TelemetriaDaysOTT(APIView):
             height=600, margin=dict(b=150)
         )
         return fig.to_json()
+    
+    def generate_pie_chart(self, data_by_franja):
+        """
+        Genera una gráfica de torta en formato imagen base64 para franja horaria total.
+        `data_dict` debe ser un diccionario con etiquetas y valores.
+        """
+        try:
+            labels = list(data_by_franja.keys())
+            values = list(data_by_franja.values())
+
+            fig = go.Figure(data=[go.Pie(
+                labels=labels,
+                values=values,
+                textinfo='label+percent',
+                insidetextorientation='radial'
+            )])
+            fig.update_layout(title="Distribución de horas por franja horaria (OTT)")
+
+            buffer = BytesIO()
+            fig.write_image(buffer, format='png')
+            buffer.seek(0)
+            encoded_image = base64.b64encode(buffer.read()).decode('utf-8')
+            return encoded_image
+        except Exception as e:
+            return None
 
     def get(self, request, days=7):
         """
@@ -1006,7 +1036,7 @@ class TelemetriaDaysOTT(APIView):
         - Gráficos por franja horaria y general
         """
         try:
-            dataOTT = list(self.get_filtered_data(int(days)))
+            dataOTT, start_date, end_date = self.get_filtered_data(int(days))
             metrics = self.compute_all(dataOTT)
 
             sorted_channels = sorted(metrics['data_by_event'], key=metrics['data_by_event'].get, reverse=True)
@@ -1021,6 +1051,9 @@ class TelemetriaDaysOTT(APIView):
                 cnts = [metrics['franja_counts'][franja].get(ch, 0) for ch in chs]
                 franja_graphs[franja] = self.generate_graph(chs, hrs, f"OTT {franja}", y2_values=cnts, show_values=True)
 
+            # Gráfico de torta con franja horaria total
+            pie_chart = self.generate_pie_chart(metrics['data_by_franja'])
+
             return Response({
                 "totals": {
                     "total_duration_ott": metrics['total_duration'],
@@ -1028,11 +1061,15 @@ class TelemetriaDaysOTT(APIView):
                     "event_duration": metrics['data_by_event'],
                     "event_count": metrics['count_by_event'],
                     "franja_event_duration": metrics['franja_events'],
-                    "franja_event_count": metrics['franja_counts']
+                    "franja_event_count": metrics['franja_counts'],
+                    "total_event_count": sum(metrics['count_by_event'].values()),
+                    "start_date": str(start_date),
+                    "end_date": str(end_date)
                 },
                 "graphs": {
                     "graph_ott": graph_ott,
-                    "graph_franjas": franja_graphs
+                    "graph_franjas": franja_graphs,
+                    "graph_pie": pie_chart
                 }
             }, status=status.HTTP_200_OK)
 
@@ -1043,7 +1080,7 @@ class TelemetriaDateOTT(APIView):
     def get_filtered_data(self, start_date, end_date):
         """
         Devuelve un iterador de registros de MergedTelemetricOTT filtrado por fechas.
-        Utiliza `.iterator()` para evitar cargar todo en memoria y reducir uso de RAM.
+        Utiliza .iterator() para evitar cargar todo en memoria y reducir uso de RAM.
         """
         try:
             start_date, end_date = sorted([start_date, end_date])
@@ -1064,6 +1101,7 @@ class TelemetriaDateOTT(APIView):
         data_by_franja = defaultdict(float)
         data_by_event = defaultdict(float)
         count_by_event = defaultdict(int)
+
         franja_ranges = {
             "Madrugada": (0, 5),
             "Mañana": (5, 12),
@@ -1078,6 +1116,7 @@ class TelemetriaDateOTT(APIView):
             duration += horas
             count_by_event[item.dataName] += 1
             data_by_event[item.dataName] += horas
+
             if item.timeDate is not None:
                 for franja, (ini, fin) in franja_ranges.items():
                     if ini <= item.timeDate < fin:
@@ -1097,9 +1136,9 @@ class TelemetriaDateOTT(APIView):
 
     def generate_chart(self, labels, values, title, y2_values=None, show_values=False):
         """
-        Genera un gráfico de barras (y opcionalmente líneas) con Plotly para representar:
-        - Duración total de eventos (valores en eje izquierdo)
-        - Conteo de eventos (valores en eje derecho)
+        Genera un gráfico de barras y línea superpuesta con Plotly para:
+        - Duración total (barras)
+        - Cantidad de vistas (línea)
         """
         fig = go.Figure()
         fig.add_trace(go.Bar(
@@ -1108,6 +1147,7 @@ class TelemetriaDateOTT(APIView):
             text=[f"{v:.2f}" for v in values] if show_values else None,
             textposition='outside' if show_values else None
         ))
+
         if y2_values:
             fig.add_trace(go.Scatter(
                 x=labels, y=y2_values,
@@ -1115,24 +1155,52 @@ class TelemetriaDateOTT(APIView):
                 marker=dict(color='blue', size=8), line=dict(width=2),
                 text=[f"{v}" for v in y2_values], textposition="top center"
             ))
+
         fig.update_layout(
-            title=title, xaxis_title='Canales',
+            title=title,
+            xaxis_title='Canales',
             yaxis=dict(type='log', title=dict(text='Horas Vistas', font=dict(color='pink'))),
             yaxis2=dict(type='log', title=dict(text='Veces Vistas', font=dict(color='blue')),
                         overlaying='y', side='right'),
             template='plotly_white',
             xaxis=dict(tickangle=45),
-            height=600, margin=dict(b=150)
+            height=600,
+            margin=dict(b=150)
         )
         return fig.to_json()
+
+    def generate_pie_chart(self, data_dict, title):
+        """
+        Genera un gráfico de torta con la distribución de duración por franja horaria.
+        """
+        labels = list(data_dict.keys())
+        values = list(data_dict.values())
+
+        fig = go.Figure(data=[go.Pie(
+            labels=labels,
+            values=values,
+            hoverinfo='label+percent',
+            textinfo='label+value'
+        )])
+
+        fig.update_layout(
+            title_text=title,
+            template='plotly_white',
+            height=500
+        )
+
+        return fig.to_image(format="png").decode("utf-8")
 
     def get(self, request, start, end):
         """
         Endpoint GET que recibe dos fechas (start y end) y retorna:
         - Duración total entre fechas
+        - Fecha de inicio y fin
+        - Cantidad total de eventos
         - Duración por franja horaria y evento
         - Conteo por evento y por franja
         - Gráficos totales y por franja
+        - Gráfico de torta de franja horaria
         """
         try:
             start_date = datetime.strptime(start, "%Y-%m-%d").date()
@@ -1145,6 +1213,7 @@ class TelemetriaDateOTT(APIView):
             counts = [metrics['count_by_event'].get(ch, 0) for ch in sorted_channels]
 
             graph_ott = self.generate_chart(sorted_channels, hours, "Total OTT", y2_values=counts, show_values=True)
+
             franja_graphs = {}
             for franja in ["Madrugada", "Mañana", "Tarde", "Noche"]:
                 chs = sorted(metrics['franja_events'][franja], key=metrics['franja_events'][franja].get, reverse=True)
@@ -1152,9 +1221,14 @@ class TelemetriaDateOTT(APIView):
                 cnts = [metrics['franja_counts'][franja].get(ch, 0) for ch in chs]
                 franja_graphs[franja] = self.generate_chart(chs, hrs, f"OTT {franja}", y2_values=cnts, show_values=True)
 
+            pie_chart = self.generate_pie_chart(metrics['data_by_franja'])
+
             return Response({
                 "totals": {
+                    "start_date": str(start_date),
+                    "end_date": str(end_date),
                     "total_duration_ott": metrics['total_duration'],
+                    "total_event_count": sum(metrics["count_by_event"].values()),
                     "franja_horaria_ott": metrics['data_by_franja'],
                     "event_duration": metrics['data_by_event'],
                     "event_count": metrics['count_by_event'],
@@ -1163,9 +1237,11 @@ class TelemetriaDateOTT(APIView):
                 },
                 "graphs": {
                     "graph_ott": graph_ott,
-                    "graph_franjas": franja_graphs
+                    "graph_franjas": franja_graphs,
+                    "graph_franja_pie": pie_chart
                 }
             }, status=status.HTTP_200_OK)
+
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 

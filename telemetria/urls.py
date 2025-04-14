@@ -12,12 +12,12 @@ urlpatterns = [
     path('fetchdata/', TestFetchAndStoreTelemetry.as_view(), name='fetchdata'),
 
     # Rutas para actualizar diferentes tablas (OTT, DVB, etc.)
-    path('ott/', UpdateDataOTT.as_view()),  # Actualiza la tabla ott
-    path('dvb/', UpdateDataDVB.as_view()),  # Actualiza la tabla dvb
-    path('stopcatchup/', UpdateDataStopCatchup.as_view()),  # Actualiza la tabla stopcatchup
-    path('endcatchup/', UpdateDataEndCatchup.as_view()),  # Actualiza la tabla endcatchup
-    path('stopvod/', UpdateDataStopVOD.as_view()),  # Actualiza la tabla stopvod
-    path('endvod/', UpdateDataEndVOD.as_view()),  # Actualiza la tabla endvod
+    path('ott/', UpdateDataOTT.as_view(), name='updatedataott'),  # Actualiza la tabla ott
+    path('dvb/', UpdateDataDVB.as_view(), name='updatedatadvb'),  # Actualiza la tabla dvb
+    path('stopcatchup/', UpdateDataStopCatchup.as_view(), name='updatedatastopcatchup'),  # Actualiza la tabla stopcatchup
+    path('endcatchup/', UpdateDataEndCatchup.as_view(), name='updatedataendcatchup'),  # Actualiza la tabla endcatchup
+    path('stopvod/', UpdateDataStopVOD.as_view(), name='updatedatastopvod'),  # Actualiza la tabla stopvod
+    path('endvod/', UpdateDataEndVOD.as_view(), name='updatedataendvod'),  # Actualiza la tabla endvod
 
     # Ruta para datos según la opción
     path('daysott/<int:days>/', TelemetriaDaysOTT.as_view()),  # Vista de datos ott por dias
